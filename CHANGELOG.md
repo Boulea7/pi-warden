@@ -6,6 +6,28 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 ## Unreleased
 
+<!-- Empty. Next release starts here. -->
+
+## 1.7.1
+
+### Added
+
+- A/B benchmark tooling, registration v4 (`eval/preregistration.md`): the run moves to the CheapestInference flat-rate subscription with no paid agent model (`cheapestinference/deepseek-v4.1-flash`, then `cheapestinference/mimo-v2.5`), the models run one after the other at concurrency 3, the repeats (6 and 7) are sized from the smoke timings to about 24 hours each, and the Jev cap is $3 per model. The stopped v3 batches are named as a stopped pilot and never analysed.
+- A/B batch Jev-error stop (`eval/jev-stop.mjs`): a run whose one failed Jev request is a cancelled trace-only sample (the guard's second request on one judged call in twenty, cancelled by its own 5-second deadline) is recorded as `cancelledTraceSamples: 1` and no longer stops the batch, found by time (the entry with a `jev:` line nearest to the failed request's time is within 1,000 ms of it and has no off-task answer) rather than by entry number; every other failure still does. Repo tooling; rides along with the next release.
+- A/B batch re-run pass (`scripts/eval-ab.mjs`, `eval/batch.mjs`, Corrections 4 of `eval/preregistration.md`): `--resume <batch folder> --rerun-excluded`, once a model's main pass is finished, runs every block that holds an `infraError` run once more (all three cells, registered cell order); the first runs move to `superseded` in `runs.json` with `supersededAt` and their evidence folders to `superseded/` in the batch folder, and leave every metric while their Jev dollars stay in the batch total. One pass per batch: the exclusions after it are final and the 10% limit applies to them; a stop during the pass resumes with `--resume`. Repo tooling; rides along with the next release.
+- A stall rule for batch runs (`eval/stall.mjs`, `--stall-min`, default 15): a pi process whose session log shows no new assistant message or tool result for that long is killed, and the run is an infrastructure failure, re-run and excluded like an API error. `--arc-timeout-min` sets the timeout of one turn of a multi-turn run.
+- Equivalent dollars for the subscription models (`eval/config.mjs`): `cheapestinference/deepseek-v4.1-flash` at DeepSeek's `deepseek-flash` rates by call timestamp, `cheapestinference/mimo-v2.5` at Xiaomi's official MiMo-V2.5 price.
+- `scripts/eval-timing.mjs`: per-run wall time, per-call queue wait and generation time, and runs per hour of a batch folder, from timings only; `node eval/power.mjs --registered R1,R2` prints the power at the registered sizes.
+- A/B thesis decision tool (`eval/decide.mjs`, `scripts/thesis-decide.mjs`): the decision rules of `eval/preregistration.md` ("Decision rules", Corrections 7) computed from one model's `runs.json` (the per-run values, the paired blocks, the exact McNemar p, the one-sided Clopper-Pearson lower bound, the violation rate ratio and its lower bound, the paired bootstrap, the Wald and delta-method sensitivity bounds, and the decision of each rule and of the model); `node scripts/thesis-decide.mjs <runs.json> --label A --blocks 120` prints the table (`--json` for JSON), and `--metrics FILE` writes the analysis set's per-run values. Tests on made-up data in `tests/eval-decide.test.ts`. Repo tooling; rides along with the next release.
+- A/B thesis decision tool metrics input (`scripts/thesis-decide.mjs`, `eval/decide.mjs`): the same script also reads a `--metrics` file (the analysis set's `task`, `family`, `repeat`, `cell`, `s`, `v`, `c`) and prints the same decision table, with a first line that says the input was a metrics file. Repo tooling; rides along with the next release.
+- A/B thesis pooled view (`eval/decide.mjs`, `scripts/thesis-pooled.mjs`): the two models' runs pooled after the run to describe the three thesis claims (the hallucination proxy `h`, the pooled paired success, and the token count `t` with medians, the 90th percentile, the count over 1,000,000, and the paired warden-vs-control ratio), labelled post hoc and deciding nothing; the `--metrics` rows of `scripts/thesis-decide.mjs` also carry `h` and `t`. Repo tooling; rides along with the next release.
+- A/B thesis registration, Corrections 5 to 7 (`eval/preregistration.md`): the stops and other events of both batches are recorded, and the analysis methods behind the decision rules' bounds and p-value are fixed before any of them is computed.
+- A/B thesis report (`eval/reports/2026-10-10-thesis-v4/README.md`): the registered decision rules applied to both models of the v4 batch, with the decision tables, per-cell tables, pair counts and bounds, sensitivity bounds, the secondary trap-capable analysis, and the infrastructure and power limits; both models show success not more than 5 points below control (one-sided 95% lower bounds +0.00 and -2.14 points), model B (`cheapestinference/mimo-v2.5`) also supports the rule-violation and Jev-increment rules, and the cost rule is inconclusive on both.
+
+### Fixed
+
+- A/B run key isolation (`scripts/eval-ab.mjs`): the harness copies the TypeSafe key into a run's agent folder only for a cell that asks Jev, so an agent in any other cell cannot turn Jev on by itself, as 6 `warden-offline` runs of the v4 batch did. Repo tooling; rides along with the next release.
+- Eval environment filtering (`eval/env.mjs`): `filterEnv` now drops an inherited `PI_WARDEN_TRACE_DIR`, so a `warden-offline` run cannot write its pi-warden trace into a folder inherited from the session that started the batch; only the cells that ask Jev get one, set by `scripts/eval-ab.mjs`.
 ## 1.7.0
 
 ### Added
