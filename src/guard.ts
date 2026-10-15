@@ -575,6 +575,134 @@ export function stripDataText(command: string): ScannedCommand {
   return { text, stripped };
 }
 
+// A shell comment can carry text the agent wrote to sway Jev; the request state must read only what the shell runs.
+/**
+ * The command text Jev reads: shell comments removed; quotes, escapes, heredoc bodies, `$#`, `${#…}`, and a `#`
+ * mid-word kept. Quote state carries across lines. A construct the scan does not model (backticks, arithmetic, `case`
+ * inside `$(…)`, quotes inside `${…}`), or an unclosed quote, returns the command unchanged.
+ */
+export function stripShellComments(command: string): string {
+  type Context = "single" | "double" | "ansi" | "brace" | "subshell";
+  const stack: Context[] = [];
+  const depths: number[] = [];
+  const heredocs: Array<{ delimiter: string; tabs: boolean }> = [];
+  let out = "";
+  // Text before this length is not trailing blank space, so a removed comment takes only the blanks before it.
+  let kept = 0;
+  let wordStart = true;
+  let index = 0;
+  const emit = (text: string, blank = false) => { out += text; if (!blank) kept = out.length; };
+  // A heredoc delimiter word, quotes and backslashes removed; undefined when it is not a plain word.
+  const delimiterWord = (): string | undefined => {
+    let word = "";
+    let raw = "";
+    while (index < command.length && /[ \t]/.test(command[index]!)) raw += command[index++];
+    while (index < command.length && !/[\s;|&<>()]/.test(command[index]!)) {
+      const char = command[index]!;
+      if (char === "'" || char === "\"") {
+        const close = command.indexOf(char, index + 1);
+        if (close < 0 || command.slice(index + 1, close).includes("\n")) return undefined;
+        word += command.slice(index + 1, close);
+        raw += command.slice(index, close + 1);
+        index = close + 1;
+        continue;
+      }
+      if (char === "\\") { if (index + 1 >= command.length || command[index + 1] === "\n") return undefined; word += command[index + 1]; raw += command.slice(index, index + 2); index += 2; continue; }
+      if (char === "$" || char === "`") return undefined;
+      word += char; raw += char; index++;
+    }
+    if (!word) return undefined;
+    emit(raw);
+    return word;
+  };
+  while (index < command.length) {
+    const char = command[index]!;
+    const context = stack.at(-1);
+    if (context === "single") { emit(char); index++; if (char === "'") stack.pop(); continue; }
+    if (context === "ansi" || context === "double" || context === "brace") {
+      if (char === "\\") { emit(command.slice(index, index + 2)); index += 2; continue; }
+      if (context === "ansi") { emit(char); index++; if (char === "'") stack.pop(); continue; }
+      if (char === "`") return command;
+      if (context === "brace") {
+        if (char === "'" || char === "\"" || char === "$") return command;
+        emit(char); index++;
+        if (char === "}") stack.pop();
+        continue;
+      }
+      if (char === "\"") { emit(char); index++; stack.pop(); continue; }
+      if (char === "$" && command[index + 1] === "(") {
+        if (command[index + 2] === "(") return command;
+        emit("$("); index += 2; stack.push("subshell"); depths.push(0); wordStart = true; continue;
+      }
+      if (char === "$" && command[index + 1] === "{") { emit("${"); index += 2; stack.push("brace"); continue; }
+      if (char === "$" && command[index + 1] === "[") return command;
+      emit(char); index++;
+      continue;
+    }
+    // Unquoted: the top level or inside `$(…)`.
+    if (char === "\\") {
+      emit(command.slice(index, index + 2));
+      if (command[index + 1] !== "\n") wordStart = false;
+      index += 2;
+      continue;
+    }
+    if (char === "#" && wordStart) {
+      while (index < command.length && command[index] !== "\n") index++;
+      out = out.slice(0, kept);
+      continue;
+    }
+    if (char === "\n") {
+      emit(char); index++; wordStart = true;
+      for (const { delimiter, tabs } of heredocs.splice(0)) {
+        while (index < command.length) {
+          const lineEnd = command.indexOf("\n", index);
+          const line = command.slice(index, lineEnd < 0 ? command.length : lineEnd);
+          emit(lineEnd < 0 ? line : `${line}\n`);
+          index = lineEnd < 0 ? command.length : lineEnd + 1;
+          if ((tabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+        }
+      }
+      continue;
+    }
+    if (char === " " || char === "\t") { emit(char, true); index++; wordStart = true; continue; }
+    if (char === "`") return command;
+    if (char === "'") { emit(char); index++; stack.push("single"); wordStart = false; continue; }
+    if (char === "\"") { emit(char); index++; stack.push("double"); wordStart = false; continue; }
+    if (char === "$") {
+      const next = command[index + 1];
+      if (next === "'") { emit("$'"); index += 2; stack.push("ansi"); wordStart = false; continue; }
+      if (next === "\"") { emit("$\""); index += 2; stack.push("double"); wordStart = false; continue; }
+      if (next === "(" && command[index + 2] === "(") return command;
+      if (next === "(") { emit("$("); index += 2; stack.push("subshell"); depths.push(0); wordStart = true; continue; }
+      if (next === "{") { emit("${"); index += 2; stack.push("brace"); wordStart = false; continue; }
+      if (next === "[") return command;
+      emit(char); index++; wordStart = false;
+      continue;
+    }
+    if (char === "(" && command[index + 1] === "(") return command;
+    if (char === "<" && command.startsWith("<<<", index)) { emit("<<<"); index += 3; wordStart = true; continue; }
+    if (char === "<" && command[index + 1] === "<") {
+      const tabs = command[index + 2] === "-";
+      emit(tabs ? "<<-" : "<<"); index += tabs ? 3 : 2;
+      const delimiter = delimiterWord();
+      if (delimiter === undefined) return command;
+      heredocs.push({ delimiter, tabs });
+      wordStart = false;
+      continue;
+    }
+    if (context === "subshell") {
+      if (wordStart && /^case\b/.test(command.slice(index))) return command;
+      if (char === "(") depths[depths.length - 1]!++;
+      if (char === ")" && depths.at(-1) === 0) { emit(char); index++; stack.pop(); depths.pop(); wordStart = false; continue; }
+      if (char === ")") depths[depths.length - 1]!--;
+    }
+    emit(char); index++;
+    wordStart = /[;|&()<>]/.test(char);
+  }
+  if (stack.length || heredocs.length) return command;
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Shell words: what a word names on the filesystem, as far as a guard can tell without running the shell. A word that
 // cannot be placed is never released, and a placeable one is classified by the path it names.
@@ -2724,10 +2852,12 @@ export function buildRequest(summary: ActionSummary, task: string | undefined, e
   // off-task/scope questions, which are trace-only and ride the sampled `traceOnly` request instead. The should-proceed
   // question rides it too, unless `shouldProceed` opts the acting request in to the steer that reads it.
   const baseQuestions = { irreversible: questions.irreversible, mutates: questions.mutates };
+  // Jev must not read shell comments: the agent can write persuasive text into one to sway the judgment.
+  const jevAction = summary.command === undefined ? summary : { ...summary, command: stripShellComments(summary.command) };
   return {
     state: {
       task: task?.trim() ? truncate(redact(task.trim()), TASK_LIMIT) : "(no user request recorded in this session)",
-      action: summary as unknown as Record<string, string | number | boolean>,
+      action: jevAction as unknown as Record<string, string | number | boolean>,
       // Clipped per message already; `recentTaskContext` bounds the count.
       context: traceOnly ? (extras.context ?? []).slice(-8).map(message => ({ role: message.role, text: truncate(redact(message.text), 750) })) : [],
       // The spine's `task` is deliberately not repeated here: state.task above already carries it, unchanged for approval.
@@ -2793,7 +2923,13 @@ async function judgeAction(action: ActionInput, options: EvaluateOptions): Promi
   const patterns = matchPatterns(action.tool, action.input, action.cwd, { commandRules: config.commandRules, commandDenyRules: config.commandDenyRules, exemptRules: config.exemptRules, pathRules: config.pathRules, scripts: scriptBodies, scratch: options.scratch, scratchPaths: options.scratchPaths, movedIn: options.movedIn });
   // A script body the command runs that hit the floor: its lines ride the request, and the call is worth a judge even
   // when the gate would have left the outer command offline.
-  const scriptLines = capScriptLines(patterns.flatMap(hit => hit.lines ?? []));
+  // The floor's hit lines keep the body's comments; Jev reads lines of the whole body with its comments stripped, so a
+  // multi-line string keeps its quote state and a code line that starts with `#` inside it stays.
+  const hitSources = new Set(patterns.flatMap(hit => hit.via ?? []));
+  const lineOptions = { commandRules: config.commandRules, commandDenyRules: config.commandDenyRules };
+  const scriptLines = capScriptLines(scriptBodies
+    .filter(source => source.kind === "shell" && hitSources.has(source.source))
+    .flatMap(source => matchingLines(stripShellComments(source.body), lineOptions, new Set(config.exemptRules ?? []))));
   const bodyHit = patterns.some(hit => hit.via !== undefined);
   // Violation pipeline: authorize per-violation, remove authorized from level computation and Jev questions.
   const violationsByHit = hitViolations(patterns, action.tool, action.input);
@@ -3136,31 +3272,27 @@ export function releaseHeld(verdict: Verdict, reason: string): void {
  * Without the bound the model writes a full accounting of the notice at the end of every task, which is noise for the
  * user reading the transcript; the wording below caps the demanded reply at one short sentence. */
 export function intentSteer(verdict: Verdict): string {
-  const score = verdict.judgment?.intentMismatch;
   const visible = (verdict.judgment?.visible ?? 0) >= VISIBLE_THRESHOLD ? " and its effect is visible outside the working tree (a commit, push, merge, publish, or launched program)" : "";
-  return `pi-warden: this ${verdict.summary.tool} call does something different from what you said you were about to do${score === undefined ? "" : ` (intent mismatch ${percent(score)})`}${visible}. It ran. Do not write a report about this notice: in your next message, name what changed and why in at most one short sentence, then continue the task (or make the described call if it is still needed). If you already accounted for a similar notice, say nothing more about it.`;
+  return `pi-warden: this ${verdict.summary.tool} call does something different from what you said you were about to do${visible}. It ran. Do not write a report about this notice: in your next message, name what changed and why in at most one short sentence, then continue the task (or make the described call if it is still needed). If you already accounted for a similar notice, say nothing more about it.`;
 }
 
 /** What the agent reads when should_proceed is low: pause and ask the user.
  * One line; the agent must not have forwarded the call without consulting the user. */
 export function shouldProceedMessage(verdict: Verdict): string {
-  const score = verdict.judgment?.shouldProceed;
-  return `pi-warden: this ${verdict.summary.tool} call may need user input before it runs${score === undefined ? "" : ` (should-proceed ${percent(score)})`}. Pause, explain what you are about to do and why, and wait for the user's approval before continuing.`;
+  return `pi-warden: this ${verdict.summary.tool} call may need user input before it runs. Pause, explain what you are about to do and why, and wait for the user's approval before continuing.`;
 }
 
 /** What the agent reads after an unrelated change ran: the request it drifted from, the two acceptable moves, one line. */
 export function offTaskSteer(verdict: Verdict): string {
-  const score = verdict.judgment?.offTask;
-  return `pi-warden: this ${verdict.summary.tool} call looks unrelated to the user's request${score === undefined ? "" : ` (off-task ${percent(score)})`}. It ran. If it serves the request, say how in at most one short sentence; otherwise return to what the user asked for, or ask before widening the work. Do not restate session state or re-answer notices you have already addressed.`;
+  return `pi-warden: this ${verdict.summary.tool} call looks unrelated to the user's request. It ran. If it serves the request, say how in at most one short sentence; otherwise return to what the user asked for, or ask before widening the work. Do not restate session state or re-answer notices you have already addressed.`;
 }
 
 /** What the agent reads the first time a command family is judged noisy: the family and one concrete way to print less. */
 export function largeOutputSteer(verdict: Verdict): string {
   const family = verdict.largeOutputFamily ?? verdict.summary.tool;
-  const score = verdict.judgment?.largeOutput;
   const log = `/tmp/warden-${family.replace(/[^A-Za-z0-9]+/g, "-")}.log`;
   return [
-    `pi-warden: \`${family}\` commands may print far more than you need${score === undefined ? "" : ` (large-output ${percent(score)})`}. This one runs unchanged.`,
+    `pi-warden: \`${family}\` commands may print far more than you need. This one runs unchanged.`,
     `Next time, redirect and show the tail: \`${family} … > ${log} 2>&1; tail -40 ${log}\`.`,
   ].join("\n");
 }
@@ -3178,12 +3310,24 @@ export function textApproves(task: string | undefined): boolean {
   return /\b(?:yes|yep|yeah|go ahead|do it|proceed|approved?|confirm(?:ed)?|ok(?:ay)?|sure|please do|run it)\b/i.test(task ?? "") && !/\b(?:no|don't|do not|stop|wait|instead|not)\b/i.test(task ?? "");
 }
 
+/** A reason with its Jev score removed, for text the agent reads: the words stay, the number goes. */
+export function scoreFreeReason(reason: string): string {
+  return reason
+    .replace(/^irreversible \d+\.\d{2}$/, "irreversible")
+    .replace(/^possibly irreversible \d+\.\d{2}$/, "possibly irreversible")
+    .replace(/^possible security weakness \d+\.\d{2} in written content$/, "possible security weakness in written content")
+    .replace(/^intent mismatch \d+\.\d{2} on a visible action \(\d+\.\d{2}; /, "intent mismatch on a visible action (")
+    .replace(/^intent mismatch \d+\.\d{2} /, "intent mismatch ")
+    .replace(/^should-proceed \d+\.\d{2} /, "should-proceed ")
+    .replace(/^off-task \d+\.\d{2} /, "off-task ");
+}
+
 /**
  * The text the agent receives when a call is held. It explains the judgment and the two acceptable next moves,
- * so the model re-plans instead of retrying. Contains no command text (the model already has it) and no secrets.
+ * so the model re-plans instead of retrying. Contains no command text (the model already has it), no scores, and no secrets.
  */
 export function steerReason(verdict: Verdict, options: { canApprove: boolean }): string {
-  const what = verdict.reasons.join("; ");
+  const what = verdict.reasons.map(scoreFreeReason).join("; ");
   const lines = [
     `pi-warden held this ${verdict.summary.tool} call before it ran: ${what}.`,
     "Do not retry it unchanged. Either (1) reach the goal with a recoverable alternative that stays inside the project (a targeted path, a dry run, a move instead of a delete, a normal push), or (2) if this exact action is genuinely required, stop and tell the user in one or two sentences what it does, what cannot be undone, and why it is needed, then wait for their reply.",
