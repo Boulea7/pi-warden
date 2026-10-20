@@ -8,6 +8,12 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 <!-- Empty. Next release starts here. -->
 
+## 1.12.1
+
+### Docs
+
+- README: the improve pass and its quiet window, the rules report, standing lessons and the capability index; how the offline floor reads a script a command runs, and which delete text it skips; the test and development scripts.
+
 ## 1.12.0
 
 ### Added
