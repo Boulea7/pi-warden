@@ -405,6 +405,17 @@ export interface PrefsConfig {
   inject: boolean;
 }
 
+/**
+ * `/warden improve`: the window the pass reads and the quiet window it arms. Both are the user's own settings: a
+ * project file cannot arm a quiet window, because a quieter rules judge is a weaker guard.
+ */
+export interface ImproveConfig {
+  /** Days a pass looks back when no number is typed: `/warden improve 4` overrides it. 1 to 90. */
+  days: number;
+  /** How long the rules judge and the text guards stay quiet in the arming session: ten minutes by default, never more than fifteen. */
+  quietMs: number;
+}
+
 /** The silent-half field trial (trial.ts): a random half of sessions records what it would have told the agent. */
 export interface TrialConfig {
   /**
@@ -539,6 +550,8 @@ export interface WardenConfig {
   conscience: ConscienceConfig;
   /** Standing preferences: corrections the user repeated in earlier sessions of this project. */
   prefs: PrefsConfig;
+  /** The `/warden improve` pass: its default window and its quiet window. */
+  improve: ImproveConfig;
   /** Silent-half field trial: off by default, user file only. */
   trial: TrialConfig;
   /** Call-waste notes: advisory sentences attached to the tool result that triggers them. */
@@ -551,7 +564,7 @@ export interface WardenConfig {
 
 export const PACKAGE_NAME = "pi-warden";
 /** Bumped when WardenConfig gains a section; extension.ts checks it so a half-updated module graph is reported, not crashed on. */
-export const CONFIG_SCHEMA = 14;
+export const CONFIG_SCHEMA = 15;
 export const PROJECT_CONFIG_FILE = `${PACKAGE_NAME}.json`;
 
 export function defaultConfig(): WardenConfig {
@@ -622,6 +635,7 @@ export function defaultConfig(): WardenConfig {
       localFloor: 0.5,
     },
     prefs: { enabled: true, inject: true },
+    improve: { days: 7, quietMs: 600000 },
     trial: { silentHalf: false },
     waste: { enabled: true, tip: false, every: 20, sleep: true, paging: true, search: true, recheck: true },
     // pi-claude-bridge compacts its own models and cancels on failure; its summary must not be replaced.
@@ -1159,12 +1173,16 @@ export function applyUserOverrides(base: WardenConfig, raw: unknown): WardenConf
     learning: applyLearning(base.learning, raw.learning),
     conscience: applyConscience(base.conscience, raw.conscience),
     prefs: applyPrefs(base.prefs, raw.prefs),
+    improve: applyImprove(base.improve, raw.improve, warnings),
     trial: applyTrial(base.trial, raw.trial),
     warnings: [...(base.warnings ?? []), ...warnings],
   };
 }
 
-/** A project cannot turn the trial on: applyProjectOverrides never copies this section, so the user file is the only source. */
+/**
+ * A project cannot turn the trial on, and cannot arm an improve quiet window: applyProjectOverrides never copies either
+ * section, so the user file is the only source.
+ */
 function applyTrial(base: TrialConfig, raw: unknown): TrialConfig {
   if (!isObject(raw)) return base;
   return { silentHalf: boolean(raw.silentHalf, base.silentHalf) };
@@ -1213,6 +1231,22 @@ function applyCompaction(base: CompactionConfig, raw: unknown, source: "user" | 
 function applyPrefs(base: PrefsConfig, raw: unknown): PrefsConfig {
   if (!isObject(raw)) return base;
   return { enabled: boolean(raw.enabled, base.enabled), inject: boolean(raw.inject, base.inject) };
+}
+
+/** The 1..90 and 0..900000 ranges are the caps of improve.ts; a value past either is refused here, not silently kept. */
+function applyImprove(base: ImproveConfig, raw: unknown, warnings: string[]): ImproveConfig {
+  if (!isObject(raw)) return base;
+  const days = raw.days;
+  const quietMs = raw.quietMs;
+  const keptDays = typeof days === "number" && Number.isSafeInteger(days) && days >= 1 && days <= 90
+    ? days
+    : base.days;
+  if (days !== undefined && keptDays !== days) warnings.push(`improve.days ${String(days)} is not a whole number of days from 1 to 90; ${base.days} is used`);
+  const keptQuiet = typeof quietMs === "number" && Number.isFinite(quietMs) && quietMs >= 0 && quietMs <= 900000
+    ? Math.trunc(quietMs)
+    : base.quietMs;
+  if (quietMs !== undefined && keptQuiet !== quietMs) warnings.push(`improve.quietMs ${String(quietMs)} is not a number of milliseconds from 0 to 900000; ${base.quietMs} is used`);
+  return { days: keptDays, quietMs: keptQuiet };
 }
 
 function applySteers(base: SteersConfig, raw: unknown): SteersConfig {
