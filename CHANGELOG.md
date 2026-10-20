@@ -8,6 +8,13 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 <!-- Empty. Next release starts here. -->
 
+## 1.12.0
+
+### Added
+
+- `/warden improve [days]` reads the last N days (default 7, 1 to 90) of this project's own sessions, rules log and hold logs, prints the counts — reading cost, calls a waste detector flags as repeats, rule judgments, fires and clears, holds by kind — and proposes at most three edits to this project's `pi-warden.md`, each naming the count it came from and the files it read. A cited number that is not on the printed list refuses the whole set; with no support it writes nothing and says the rules held. A confirmed run writes a timestamped backup and then the file atomically, and refuses a file that changed under it. Nothing is sent and no judge request is made.
+- While the pass runs it arms its own session's quiet window (`improve.quietMs`, default `600000`, capped at `900000`): the rules judge, the turn-start rule reminder and the text guards stay quiet in that session only, other Pi sessions keep judging, the window expires by the clock, and the destructive-action floor, path rules, deny list and arming rules stay on. `/warden status` shows it while it is live.
+
 ## 1.11.3
 
 ### Fixed
