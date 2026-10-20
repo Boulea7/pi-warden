@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { join, resolve as pathResolve } from "node:path";
 import { homedir } from "node:os";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -85,6 +85,11 @@ import { formatCompaction, relevanceCompaction } from "./relevance.js";
 import type { CompactionStats, FallbackReason } from "./relevance.js";
 import { applyLoopAction, formatLoopsForUser, formatOpenLoops, LOOP_ACTIONS, LOOP_CHARS, loopsFingerprint, loopsPath, openLoops, readLoops, updateLoops } from "./loops.js";
 import { changePrefsStore, emptyWordCounts, evaluatePrefs, forgetPref, formatPrefs, LESSON_CHARS, prefsMessage, prefsStorePath, readPrefsStore, recordLesson, scanPreferences } from "./prefs.js";
+import { MAX_SESSIONS, SCAN_BUDGET_MS } from "./prefs.js";
+import {
+  applyProposals, buildProposals, computeCounts, formatCounts, formatDiff, formatEmpty, formatHeld, formatProposals,
+  gatherSessions, IMPROVE_MAX_DAYS, parseImproveArgs, QuietWindow, readRecords, validateProposals, writeRulesFile,
+} from "./improve.js";
 import { armFor, isSuppressed, steerDeliveryKind, TRIAL_ENTRY_TYPE, trialText } from "./trial.js";
 import type { SuppressedKind, TrialArm, TrialDeliveryKind, TrialRecord } from "./trial.js";
 import type { PrefItem, PrefsScan } from "./prefs.js";
@@ -431,6 +436,9 @@ export default function wardenExtension(host: ExtensionAPI): void {
   let budgetExhausted = false;
   let stats = freshStats();
   const widget = new Map<GuardName, string>();
+  // `/warden improve`'s quiet window. It carries this session's id and expires by the clock; it lives in this session's
+  // own extension instance, so no other Pi session can see it or be silenced by it.
+  const quiet = new QuietWindow();
   const trace = new Trace();
   // The trace file for a host without the terminal UI; set per session when PI_WARDEN_TRACE_DIR is an absolute path.
   let traceFile: TraceFile | undefined;
@@ -467,6 +475,12 @@ export default function wardenExtension(host: ExtensionAPI): void {
   let holdLog: HoldLog | undefined;
   /** The session id of the open session; every hold row of it carries it. */
   let activeSessionId: string | undefined;
+  /** The id guards key session state by: the host's, or this process when the host gives none. */
+  const sessionIdFor = (ctx: ExtensionContext | ExtensionCommandContext): string => {
+    const manager = ctx.sessionManager as Partial<ExtensionContext["sessionManager"]>;
+    const id = typeof manager.getSessionId === "function" ? manager.getSessionId() : undefined;
+    return id ?? String(process.pid);
+  };
   /** The silent-half trial arm of the open session: "live" unless the user turned the trial on and the id hashed silent. */
   let trialArm: TrialArm = "live";
   /**
@@ -820,8 +834,14 @@ export default function wardenExtension(host: ExtensionAPI): void {
     lastUi = ctx.ui as unknown as PanelUi;
     if (!config.widget.enabled || widget.size === 0) { ctx.ui.setWidget(WIDGET, undefined); return; }
     let entries = [...widget].map(([guard, line]) => ({ guard, line }));
+    // Live state, not an event: while this session's quiet window is live its line is the status line, and it goes
+    // away by the clock. The trace keeps every verdict the window hides.
+    const quietLine = quiet.statusLine(sessionIdFor(ctx));
+    const quietEntry = quietLine ? { guard: "rules" as GuardName, line: `warden · rules · quiet · ${quietLine}` } : undefined;
+    if (quietEntry) entries = [quietEntry, ...entries];
     // In live mode: only show the most recent guard, re-rendered with sentence templates.
     if (config.widget.barMode === "live" && entries.length > 0) {
+      if (quietEntry) { ctx.ui.setWidget(WIDGET, (_tui, theme) => statusWidget([quietEntry], theme), { placement: config.widget.placement }); return; }
       const lastEntry = trace.entries().at(-1);
       if (lastEntry?.tokens) {
         const template = pickSentenceTemplate(lastEntry.guard, lastEntry.tokens);
@@ -1733,7 +1753,8 @@ export default function wardenExtension(host: ExtensionAPI): void {
     // the background, so the prompt never waits for Jev; the answer is delivered at the end of a turn whose loop continues, through
     // the steer path, appended after the newest message, so nothing earlier in the context moves and a warm prompt
     // cache stays valid. An answer that arrives after the run ended is dropped and traced. Nothing here throws.
-    if (config.enabled && config.rules.enabled && config.rulesAtTurnStart.enabled) curateTurnStart(ctx, config, event.prompt);
+    // The turn-start rule reminder is a rules request too, so this session's quiet window silences it as well.
+    if (config.enabled && config.rules.enabled && config.rulesAtTurnStart.enabled && !quiet.active(sessionIdFor(ctx))) curateTurnStart(ctx, config, event.prompt);
   });
 
   // Each assistant message is judged on its own; Pi does not forward the stream's own "start" event, so this is the reset.
@@ -1953,14 +1974,17 @@ export default function wardenExtension(host: ExtensionAPI): void {
       }
     }
     const shellSkips: ShellSkip[] = [...(shell?.skips ?? []), ...shellFiles.slice(SHELL_RULES_CHECKS).map(write => ({ path: write.path, reason: `only the first ${SHELL_RULES_CHECKS} files a command writes are judged` }))];
-    const rulesChecks: Array<{ check: Promise<RulesVerdict>; shellWrite?: ShellWrite }> = !config.rules.enabled ? []
+    // The quiet window silences the rules judge for the session that armed it; the action guard and its floor are untouched.
+    const quietNow = quiet.active(sessionIdFor(ctx));
+    const rulesLive = config.rules.enabled && !quietNow;
+    const rulesChecks: Array<{ check: Promise<RulesVerdict>; shellWrite?: ShellWrite }> = !rulesLive ? []
       : event.toolName === "write" || event.toolName === "edit" ? [{ check: rulesGuard.inspect(call, siblings, rulesOptions) }]
       : shellFiles.slice(0, SHELL_RULES_CHECKS).map((shellWrite, index) => ({ shellWrite, check: rulesGuard.inspect({ id: `${event.toolCallId}#write${index}`, tool: "write", input: { path: shellWrite.path, content: shellWrite.content } }, siblings, rulesOptions) }));
     for (const { check } of rulesChecks) check.catch(() => undefined);
     const verdict = await actionGuard.inspect(
       call,
       { task, context: recentTaskContext(ctx), siblings, plan: assistantPlan(ctx, isVisibleAction(event.toolName, event.input as Record<string, unknown>)), spine: taskSpine(ctx.sessionManager.getBranch()), asked: askedBeforeReply(ctx) },
-      { config: config.action, cwd: ctx.cwd, judge, signal: ctx.signal, slop: config.slop, security: config.security, largeOutput: config.context.largeOutput, rules: config.rules, previousActions: regretCandidates.length ? regretCandidates : undefined, scratch: sessionScratch, scratchPaths: sessionScratchPaths, movedIn: sessionMovedIn.size ? [...sessionMovedIn] : undefined, hostPaths: sessionHostPaths },
+      { config: config.action, cwd: ctx.cwd, judge, signal: ctx.signal, slop: { ...config.slop, enabled: config.slop.enabled && !quietNow }, security: config.security, largeOutput: config.context.largeOutput, rules: config.rules, previousActions: regretCandidates.length ? regretCandidates : undefined, scratch: sessionScratch, scratchPaths: sessionScratchPaths, movedIn: sessionMovedIn.size ? [...sessionMovedIn] : undefined, hostPaths: sessionHostPaths },
     );
     if (verdict.source === "skipped") return;
     // Arming check: if any armed rule's command regex matches this call, inject a hit into the verdict.
@@ -2848,7 +2872,8 @@ export default function wardenExtension(host: ExtensionAPI): void {
     }
     // ── Turn rules: one end-of-run judgment against the whole diff, and the files no per-edit check saw ──
     // One steer for the findings, through the done-check's delivery; the verdicts land in the rules log like the rest.
-    if (config.rules.enabled && turnSnapshot) {
+    const quietNow = quiet.active(sessionIdFor(ctx));
+    if (config.rules.enabled && !quietNow && turnSnapshot) {
       // The run end waits for the snapshot the run start began; a run that ended first has been waiting since.
       const snapshot = await turnSnapshot;
       turnSnapshot = undefined;
@@ -2899,10 +2924,11 @@ export default function wardenExtension(host: ExtensionAPI): void {
     if (!finalMessage || !judge) return;
     // Pi shows the agent as working until this hook returns, so the two independent checks share one round trip.
     const task = latestUserPrompt(ctx);
-    const proseCheck = config.slop.enabled && config.slop.prose.enabled && finalMessage.length >= config.slop.prose.minChars
+    // The text guards are quiet too while this session's quiet window is live: the file is being rewritten, not defended.
+    const proseCheck = !quietNow && config.slop.enabled && config.slop.prose.enabled && finalMessage.length >= config.slop.prose.minChars
       ? evaluateProse(task, finalMessage, { config: config.slop.prose, judge, timeoutMs: config.timeoutMs, signal: ctx.signal })
       : undefined;
-    const doneCheck = config.done.enabled && needsDoneCheck(evidence)
+    const doneCheck = !quietNow && config.done.enabled && needsDoneCheck(evidence)
       ? evaluateDone(task, finalMessage, evidence, { config: config.done, judge, timeoutMs: config.timeoutMs, signal: ctx.signal })
       : undefined;
     if (proseCheck) {
@@ -3026,9 +3052,9 @@ export default function wardenExtension(host: ExtensionAPI): void {
     },
   });
 
-  const actions = ["status", "rules", "report", "enable", "disable", "mode", "config", "test", "trace", "init", "audit", "index", "prefs", "loops", "recommend", "unmute", "bench"];
+  const actions = ["status", "rules", "report", "improve", "enable", "disable", "mode", "config", "test", "trace", "init", "audit", "index", "prefs", "loops", "recommend", "unmute", "bench"];
   pi.registerCommand("warden", {
-    description: "pi-warden status, active rules, config (set/get/editor), TypeSafe consent, mode, trace panel, recommend, standing preferences, open loops, and a synthetic guard test",
+    description: "pi-warden status, active rules, config (set/get/editor), TypeSafe consent, mode, trace panel, recommend, standing preferences, improve, open loops, and a synthetic guard test",
     getArgumentCompletions(prefix) {
       const matches: Array<{ value: string; label: string; description?: string }> = actions.filter(action => action.startsWith(prefix)).map(action => ({ value: action, label: action }));
       // `rules check`, `rules audit`, `rules calibrate`, and `rules tune` are two-word actions: `rules` on its own stays the local list.
@@ -3079,6 +3105,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
             lifetimeLine,
             `Rules: ${config.rules.enabled ? `${rulesGuard.describe(ctx.cwd, config.rules)}${Object.keys(config.rules.sensitivePaths).length ? `; ${Object.keys(config.rules.sensitivePaths).length} sensitive path${Object.keys(config.rules.sensitivePaths).length === 1 ? "" : "s"}` : ""}` : "off"}.`,
             ...(config.action.armingRules.length > 0 ? [`Arming: ${arming.statusLine() || "no rules armed"}.`] : []),
+            ...(quiet.statusLine(sessionIdFor(ctx)) ? [`Quiet: ${quiet.statusLine(sessionIdFor(ctx))}.`] : []),
             `Desktop notifications: ${config.notify.enabled ? `on (${config.notify.command.length ? `command ${config.notify.command[0]}` : (await (notifier ??= detectNotifier())) ?? "no notifier found on this machine"}; cooldown ${config.notify.cooldownMs} ms)` : "off (\"notify\": { \"enabled\": true } in the config turns them on)"}.`,
             `Config: ${userConfigPath(dirs)}${ctx.isProjectTrusted() ? ` and ${projectConfigPath(ctx.cwd, dirs)}` : ""}.`,
             ...(config.warnings?.length ? [`Config warnings: ${config.warnings.join("; ")}.`] : []),
@@ -3267,6 +3294,89 @@ export default function wardenExtension(host: ExtensionAPI): void {
           }
           report(formatPrefs(scan, items));
           return;
+        }
+        if (action === "improve") {
+          const yes = tokens.slice(1).some(token => token === "--yes");
+          const typed = tokens.slice(1).filter(token => !token.startsWith("--"));
+          if (typed.length > 1) { report(`Usage: /warden improve [days] [--yes], where days is a whole number from 1 to ${IMPROVE_MAX_DAYS}.`, "warning"); return; }
+          const parsed = parseImproveArgs(typed[0] ?? "");
+          if ("error" in parsed) { report(parsed.error, "warning"); return; }
+          // No number typed means the configured window; a number typed always wins, so the pass reads what was asked for.
+          const days = typed.length ? parsed.days : Math.min(Math.max(Math.trunc(config.improve.days) || parsed.days, 1), IMPROVE_MAX_DAYS);
+          const session = sessionIdFor(ctx);
+          const liveWindow = quiet.statusLine(session);
+          if (liveWindow) { report(`warden: a quiet window from an earlier /warden improve is still live (${liveWindow}); nothing was read.`, "warning"); return; }
+          const manager = ctx.sessionManager as Partial<ExtensionContext["sessionManager"]>;
+          const dir = typeof manager.getSessionDir === "function" ? manager.getSessionDir() : undefined;
+          if (!dir) { report("warden: this session has no session directory, so there are no session files to read.", "warning"); return; }
+          const exclude = typeof manager.getSessionFile === "function" ? manager.getSessionFile() : undefined;
+          const quietMs = config.improve.quietMs;
+          let wrote = false;
+          if (quietMs > 0) quiet.arm(session, quietMs);
+          try {
+            const started = performance.now();
+            const gather = await gatherSessions({ dir, cwd: ctx.cwd, exclude, days, maxSessions: MAX_SESSIONS });
+            const now = Date.now();
+            const { logPath, records, holds } = await readRecords(ctx.cwd, dirs, gather.readings, days, now);
+            const set = rulesGuard.store.load(ctx.cwd, config.rules);
+            const counts = computeCounts({ days, now, readings: gather.readings, skipped: gather.skipped, ruleRecords: records, holds, currentRules: set?.rules.map(rule => ({ id: rule.id, name: rule.name })) ?? [] });
+            const elapsed = Math.round(performance.now() - started);
+            const read = gather.found > gather.readings.length ? `${gather.readings.length} of ${gather.found} session files read` : `${gather.readings.length} session file${gather.readings.length === 1 ? "" : "s"} read`;
+            const head = `pi-warden improve: last ${days} day${days === 1 ? "" : "s"}, ${read}, ${counts.skipped} skipped, ${elapsed} ms (scan budget ${SCAN_BUDGET_MS} ms).`;
+            const countsText = formatCounts(counts);
+            const files = [
+              `read: ${gather.readings.map(reading => reading.path).join(", ") || "none"}`,
+              ...(gather.skipped.length ? [`skipped: ${gather.skipped.map(skip => `${skip.path} (${skip.reason})`).join(", ")}`] : []),
+            ].join("\n");
+            if (!counts.sessions) { report([head, countsText, formatEmpty(days), files].join("\n")); return; }
+            const tier = rulesGuard.store.loadTiered(ctx.cwd, config.rules);
+            const rulesFile = join(ctx.cwd, RULES_FILE);
+            if (tier.tier !== "root" || !set) {
+              const from = set ? `rules come from ${set.sources.join(", ")}` : "no rules file was found";
+              report([head, countsText, files, `Nothing was written: /warden improve edits this project's ${RULES_FILE}, and ${from}.`].join("\n"));
+              return;
+            }
+            let before: string;
+            try {
+              before = await readFile(rulesFile, "utf8");
+            } catch (error) {
+              report([head, countsText, `warden: ${RULES_FILE} could not be read (${error instanceof Error ? error.message : String(error)}); nothing was written.`].join("\n"), "warning");
+              return;
+            }
+            const proposals = buildProposals({ counts, rulesText: before, rules: set.rules.map(rule => ({ id: rule.id, name: rule.name })), ruleRecords: records, logPath });
+            const refusal = validateProposals(proposals, counts);
+            if (refusal) { report([head, countsText, files, refusal].join("\n"), "warning"); return; }
+            if (!proposals.length) {
+              report([head, countsText, formatHeld(counts, set.rules.length), files].join("\n"));
+              return;
+            }
+            const after = applyProposals(before, proposals);
+            const diff = formatDiff(before, after);
+            const plan = [head, countsText, files, formatProposals(proposals), `Changes to ${RULES_FILE}:`, diff].join("\n");
+            if (ctx.hasUI) {
+              if (!await ctx.ui.confirm(`warden: write ${proposals.length} change${proposals.length === 1 ? "" : "s"} to ${RULES_FILE}?`, plan)) {
+                report(`Cancelled. ${RULES_FILE} is unchanged.`);
+                return;
+              }
+            } else if (!yes) {
+              report([plan, `Nothing was written: a headless run needs --yes before /warden improve rewrites ${RULES_FILE}.`].join("\n"), "warning");
+              return;
+            }
+            const written = await writeRulesFile({ file: rulesFile, before, after });
+            if (written.error) { report(written.error, "warning"); return; }
+            wrote = true;
+            // The user keeps editing the file after the pass, so the window counts from the end of the write, not its start.
+            if (quietMs > 0) quiet.arm(session, quietMs);
+            report([
+              `Wrote ${RULES_FILE}: ${proposals.length} change${proposals.length === 1 ? "" : "s"}, backup at ${written.backup}.`,
+              ...(quiet.statusLine(session) ? [`Quiet: the rules judge and the text guards stay quiet in this session until ${new Date(quiet.expiresAt).toISOString().slice(11, 16)}; /warden status shows it.`] : ["The quiet window is off (improve.quietMs is 0); the rules judge keeps running."]),
+              diff,
+            ].join("\n"));
+            return;
+          } finally {
+            // Every exit path leaves this session's judge back on: an unfinished pass disarms the window it armed.
+            if (quietMs > 0 && !wrote) quiet.disarm();
+          }
         }
         if (action === "recommend") {
           // Learning-driven recommendations based on hold history

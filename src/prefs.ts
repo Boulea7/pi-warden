@@ -503,6 +503,39 @@ export async function projectSessionDirs(dir: string, cwd: string | undefined, k
   return [dir, ...found.filter((path): path is string => path !== undefined)];
 }
 
+export interface ProjectSessionFile {
+  path: string;
+  mtime: number;
+}
+
+/**
+ * The session files of this project's directories written since `oldest`, newest first. Pi files sessions by working
+ * directory, so `projectSessionDirs` decides what belongs to the project; nothing here reads a session's content.
+ */
+export async function projectSessionFiles(options: {
+  dir: string;
+  cwd?: string | undefined;
+  exclude?: string | undefined;
+  oldest: number;
+}): Promise<{ files: ProjectSessionFile[]; directories: number; roots: string[] }> {
+  const exclude = options.exclude ? basename(options.exclude) : undefined;
+  const roots = options.cwd ? await worktreeRoots(options.cwd) : [];
+  const directories = await projectSessionDirs(options.dir, options.cwd, roots);
+  const files: ProjectSessionFile[] = [];
+  for (const dir of directories) {
+    // No session directory yet (a first session, or an in-memory session): nothing earlier to learn from there.
+    const names = (await readdir(dir).catch(() => [] as string[])).filter(name => name.endsWith(".jsonl") && name !== exclude);
+    const infos = await Promise.all(names.map(async name => {
+      const path = join(dir, name);
+      const info = await stat(path).catch(() => undefined);
+      return info?.isFile() && info.mtimeMs >= options.oldest ? { path, mtime: info.mtimeMs } : undefined;
+    }));
+    for (const info of infos) if (info) files.push(info);
+  }
+  files.sort((a, b) => b.mtime - a.mtime);
+  return { files, directories: directories.length, roots };
+}
+
 /**
  * Reads the newest earlier sessions of this project and its worktrees (at most maxSessions, none older than
  * maxAgeDays). Read-only.
@@ -511,21 +544,7 @@ export async function scanPreferences(options: ScanOptions): Promise<PrefsScan> 
   const started = performance.now();
   const now = options.now ?? Date.now();
   const oldest = now - (options.maxAgeDays ?? MAX_AGE_DAYS) * 86_400_000;
-  const exclude = options.exclude ? basename(options.exclude) : undefined;
-  const roots = options.cwd ? await worktreeRoots(options.cwd) : [];
-  const directories = await projectSessionDirs(options.dir, options.cwd, roots);
-  const files: Array<{ path: string; mtime: number }> = [];
-  for (const dir of directories) {
-    // No session directory yet (a first session, or an in-memory session): nothing earlier to learn from there.
-    const names = (await readdir(dir).catch(() => [] as string[])).filter(name => name.endsWith(".jsonl") && name !== exclude);
-    const infos = await Promise.all(names.map(async name => {
-      const path = join(dir, name);
-      const info = await stat(path).catch(() => undefined);
-      return info?.isFile() && info.mtimeMs >= oldest ? { path, mtime: info.mtimeMs } : undefined;
-    }));
-    for (const info of infos) if (info) files.push(info);
-  }
-  files.sort((a, b) => b.mtime - a.mtime);
+  const { files, directories, roots } = await projectSessionFiles({ dir: options.dir, cwd: options.cwd, exclude: options.exclude, oldest });
   const candidates: PrefCandidate[] = [];
   const counts = emptyWordCounts();
   let scanned = 0;
@@ -543,7 +562,7 @@ export async function scanPreferences(options: ScanOptions): Promise<PrefsScan> 
     counts,
     project: roots[0] ?? options.cwd ?? options.dir,
     scanned,
-    directories: directories.length,
+    directories,
     ms: performance.now() - started,
   };
 }
