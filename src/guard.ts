@@ -17,7 +17,7 @@ import { resolveRulesFile } from "./rules-file.js";
 import { mergeWrites, shellWrites } from "./shell-writes.js";
 import { COMMAND_TOOLS, commandOf } from "./tools.js";
 import { actionAskGate } from "./ask-gate.js";
-import { scriptSources, shellParts, type ScriptSource } from "./script-bodies.js";
+import { commandIndex, scriptSources, shellCommands, shellParts, type ScriptSource, type ShellWord as CommandWord } from "./script-bodies.js";
 import { actionTokens, DEFAULT_TEMPLATES, renderTemplate } from "./widget.js";
 
 export type Level = "allow" | "warn" | "confirm" | "deny";
@@ -357,6 +357,49 @@ const INTERPRETERS = /^(?:python[\d.]*|node|ruby|perl|php|deno|bun|tsx|Rscript|l
 const EXEC_CALLS = /\b(?:os\.system|os\.popen|os\.exec\w*|subprocess|child_process|execSync|spawnSync|execFileSync|spawn\(|exec\(|system\(|popen\(|shell_exec|passthru|proc_open|Open3|IO\.popen|Deno\.run|Deno\.Command|Bun\.spawn|Bun\.\$|%x[\[{(]|`[^`\n]*\b(?:rm|git|dd|mkfs|kubectl|terraform)\b)/;
 const SUBSTITUTION = /\$\(|`/;
 
+/** Whether a command runs a shell sink by the commands bash reads: also inside `( )`, `$( )`, `<( )`, a keyword, or a wrapper. */
+function runsShellSink(command: string): boolean {
+  return shellCommands(command).some(({ words }) => {
+    const at = commandIndex(words);
+    return at !== undefined && words.slice(0, at + 1).some(word => SHELL_SINKS.has(basename(word.text)));
+  });
+}
+
+/** A word as bash passes it, written so the delete classifier reads that value. */
+function plainWord(word: CommandWord): string {
+  return /^[^\s'"\\;&|<>()`]+$/.test(word.text) ? word.text : `"${word.text.replace(/["\\`]/g, "\\$&")}"`;
+}
+
+/**
+ * The command with each command word that runs `rm` written as a plain `rm`, so `\rm`, `"rm"`, `r''m`, `/bin/rm`, and
+ * `${x}rm` (an unset `x` is empty) are read as the delete bash runs. A word right after `)` gets a blank before it.
+ */
+function plainRmWords(command: string): string {
+  if (!/r\S*m/.test(command)) return command;
+  const spans: Array<readonly [number, number]> = [];
+  const lines = new Set<string>();
+  for (const { words } of shellCommands(command)) {
+    const at = commandIndex(words);
+    const word = at === undefined ? undefined : words[at];
+    if (!word || basename(word.bare) !== "rm") continue;
+    if (word.span) {
+      const [start, end] = word.span;
+      if (command.slice(start, end) !== "rm" || (start > 0 && !/[\s"'(`]/.test(command[start - 1]!))) spans.push(word.span);
+    } else if ((word as { raw?: string }).raw !== "rm") lines.add(["rm", ...words.slice(at! + 1).map(plainWord)].join(" "));
+  }
+  let text = "";
+  let last = 0;
+  for (const [start, end] of spans.sort((a, b) => a[0] - b[0])) {
+    if (start < last) continue;
+    text += `${command.slice(last, start)}${start > 0 && !/[\s"'(`]/.test(command[start - 1]!) ? " " : ""}rm`;
+    last = end;
+  }
+  text += command.slice(last);
+  // A delete word read inside a string (`sh -c "\"rm\" -rf T"`, `eval '\rm -rf T'`) has no place in the text, so its
+  // plain words follow on lines of their own, after a `cd -` the guard does not follow: a relative target stays unread.
+  return lines.size ? `${text}\ncd -\n${[...lines].join("\n")}` : text;
+}
+
 function headOf(segment: string): string | undefined {
   const tokens = segment.trim().split(/\s+/);
   let index = 0;
@@ -434,14 +477,38 @@ function blankQuotes(segment: string): string {
   for (let index = 0; index < segment.length; index++) {
     const char = segment[index]!;
     if (char !== "'" && char !== "\"") { out += char; continue; }
-    let end = index + 1;
-    while (end < segment.length && segment[end] !== char) end += char === "\"" && segment[end] === "\\" ? 2 : 1;
+    let end = char === "\"" ? doubleQuoteEnd(segment, index) : segment.indexOf("'", index + 1);
+    if (end < 0) end = segment.length;
     if (end >= segment.length) { out += segment.slice(index); break; }
     const inner = segment.slice(index + 1, end);
     out += char === "\"" && (SUBSTITUTION.test(inner) || SECRET_EXPANSION.test(inner)) ? `${char}${inner}${char}` : `${char}[text]${char}`;
     index = end;
   }
   return out;
+}
+
+/**
+ * The quote that closes the double-quoted string opening at `open`, or -1; a `$( … )` inside is read whole, quotes and
+ * all. Each open string is `"` and each open substitution its paren depth, on a stack: a deep `"$("$(…` cannot overflow.
+ */
+function doubleQuoteEnd(text: string, open: number): number {
+  const stack: Array<"\"" | number> = ["\""];
+  for (let at = open + 1; at < text.length; at++) {
+    const char = text[at];
+    const top = stack[stack.length - 1]!;
+    if (char === "\\") { at++; continue; }
+    if (top === "\"") {
+      if (char === "\"") stack.pop();
+      else if (char === "$" && text[at + 1] === "(") { stack.push(1); at++; }
+    } else if (char === "'") {
+      at = text.indexOf("'", at + 1);
+      if (at < 0) return -1;
+    } else if (char === "\"") stack.push("\"");
+    else if (char === "(") stack[stack.length - 1] = top + 1;
+    else if (char === ")") { if (top === 1) stack.pop(); else stack[stack.length - 1] = top - 1; }
+    if (!stack.length) return at;
+  }
+  return -1;
 }
 
 function isDataSegment(segment: string): boolean {
@@ -545,8 +612,10 @@ export function stripDataText(command: string): ScannedCommand {
     // The whole pipeline on the heredoc line counts: `cat <<EOF | bash` executes the body as much as `bash <<EOF` does.
     const heads = splitShell(line).map(segment => headOf(segment) ?? "");
     const consumer = headOf(line.slice(0, heredoc.operator - heredoc.line)) ?? "";
+    // The shell that reads the body can sit in a substitution on the line: `cat <(sh <<EOF`.
+    const innermost = headOf(line.slice(0, heredoc.operator - heredoc.line).split(/[(`]/).pop()!) ?? "";
     // 'EOF', "EOF", E"O"F, and \EOF make the body literal; a bare EOF body is expanded, so a substitution inside it runs.
-    const executed = heads.some(head => SHELL_SINKS.has(head)) || (INTERPRETERS.test(consumer) && EXEC_CALLS.test(bodyText)) || (!heredoc.literal && SUBSTITUTION.test(bodyText));
+    const executed = heads.some(head => SHELL_SINKS.has(head)) || SHELL_SINKS.has(innermost) || (INTERPRETERS.test(consumer) && EXEC_CALLS.test(bodyText)) || (!heredoc.literal && SUBSTITUTION.test(bodyText));
     scanned += command.slice(cursor, heredoc.start);
     cursor = heredoc.end;
     if (executed || !body) { scanned += body; continue; }
@@ -557,7 +626,7 @@ export function stripDataText(command: string): ScannedCommand {
   const joined = blankMessageFlags(scanned);
   const segments = splitShell(joined);
   // A shell sink anywhere may run text written earlier in the same command (`cat <<EOF > run.sh` then `bash run.sh`), so nothing is treated as data.
-  if (segments.some(segment => { const head = headOf(segment); return head !== undefined && SHELL_SINKS.has(head); })) return { text: command, stripped: false };
+  if (segments.some(segment => { const head = headOf(segment); return head !== undefined && SHELL_SINKS.has(head); }) || runsShellSink(joined)) return { text: command, stripped: false };
   if (/\b(?:ba|z|da|k)?sh\s+-[a-zA-Z]*c\b/.test(joined)) return { text: command, stripped: false };
   let text = joined;
   if (joined !== scanned) stripped = true;
@@ -2100,7 +2169,9 @@ function commandPatternHits(raw: string, cwd: string | undefined, options: Patte
   const privileged = PRIVILEGED.test(command);
   const movesIn = MOVES_IN.test(unquoted(raw)) || MOVES_IN.test(unquoted(command));
   const scratch = privileged || movesIn || !scratchPlatform(options?.platform) ? undefined : options?.scratch;
-  const segments = splitShell(command);
+  // The rm segments read the command word before data is blanked (`cat <(r''m …)`); the rules keep the typed text.
+  const plain = plainRmWords(raw);
+  const segments = splitShell(plain === raw ? command : stripDataText(plain).text);
   // A command that mounts, attaches, binds, or syncs data in with its source removed can put existing data under a
   // path a later `rm` deletes, and the birth-time walk cannot see it: no release rule applies at all then.
   const blocked = privileged || MOVES_DATA_IN.test(unquoted(command)) || MOVES_DATA_IN.test(unquoted(raw));
@@ -2148,7 +2219,7 @@ function matchingLines(body: string, options: PatternOptions | undefined, exempt
     const text = line.trim();
     if (!text) continue;
     const matched = SHELL_RULES.some(rule => !exempt.has(rule.id) && rule.test.test(text))
-      || RM_LINE.test(text)
+      || RM_LINE.test(text) || RM_LINE.test(plainRmWords(text))
       || (!exempt.has("sensitive-path") && SENSITIVE_PATH.test(text))
       || userRules.some(rule => rule.test.test(text));
     if (!matched) continue;
@@ -2177,7 +2248,7 @@ export function matchPatterns(tool: string, input: Record<string, unknown>, cwd?
     merge(commandPatternHits(code, cwd, options, exempt));
     // The bodies of scripts the command runs are read one level deep: a script the body calls is not read again.
     if (view?.shell) {
-      const sources = options?.scripts ?? scriptSources(stripDataText(code).text, cwd);
+      const sources = options?.scripts ?? scriptSources(code, cwd);
       for (const source of sources) {
         if (source.kind !== "shell") continue;
         const body = stripShellComments(source.body);
@@ -2969,8 +3040,10 @@ async function judgeAction(action: ActionInput, options: EvaluateOptions): Promi
   const view = commandOf(action.tool, action.input);
   // Read the script bodies once: the floor labels their hits and the ask gate reads their shapes from the same list.
   // The text the shell runs, as the floor reads it: comments removed and backslash-newlines joined, then data blanked.
-  const shellText = view?.shell ? stripDataText(stripShellComments(view.command)).text : undefined;
-  const scriptBodies = shellText === undefined ? [] : scriptSources(shellText, action.cwd);
+  // The script search reads quotes itself, so it gets the text before blanking: `cat <("./a.sh")` runs a.sh.
+  const code = view?.shell ? stripShellComments(view.command) : undefined;
+  const shellText = code === undefined ? undefined : stripDataText(code).text;
+  const scriptBodies = code === undefined ? [] : scriptSources(code, action.cwd);
   const patterns = matchPatterns(action.tool, action.input, action.cwd, { commandRules: config.commandRules, commandDenyRules: config.commandDenyRules, exemptRules: config.exemptRules, pathRules: config.pathRules, scripts: scriptBodies, scratch: options.scratch, scratchPaths: options.scratchPaths, movedIn: options.movedIn });
   // A script body the command runs that hit the floor: its lines ride the request, and the call is worth a judge even
   // when the gate would have left the outer command offline.
@@ -3591,7 +3664,7 @@ interface RmSegment {
 /** Every rm segment of a command, read the way matchPatterns reads it (data text blanked). */
 function rmSegments(command: string): RmSegment[] {
   const segments: RmSegment[] = [];
-  for (const segment of splitShell(stripDataText(command).text)) {
+  for (const segment of splitShell(stripDataText(plainRmWords(command)).text)) {
     const raw = RM_COMMAND_RE.exec(segment);
     if (raw) segments.push({ id: classifyRm(segment)?.id, targets: rmSegmentTargets(raw[1]!) });
   }

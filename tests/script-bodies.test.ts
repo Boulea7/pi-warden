@@ -5,9 +5,11 @@
  * level only), the exemption, and the redacted, capped `script_lines` the request carries.
  */
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { after, before, test } from "node:test";
 import { actionAskGate } from "../src/ask-gate.js";
 import { defaultConfig } from "../src/config.js";
@@ -333,5 +335,358 @@ test("the drive's comment, echo message, and sed shapes still run", async () => 
       "sh ./say.sh",
       'sed -n "/alpha\\|down=/p" scripts/clean.sh; touch "$HOME/pwv-c"',
     ]) assert.deepEqual(matchPatterns("bash", { command }, dir), [], command);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+/** A project with `a.sh` and `sub/a.sh`, each of which deletes its first argument, and a `package.json` script in `sub/`. */
+const shapesProject = async (): Promise<string> => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-warden-shapes-"));
+  await mkdir(join(dir, "sub"));
+  for (const path of ["a.sh", "sub/a.sh"]) {
+    await writeFile(join(dir, path), '#!/bin/sh\nrm -rf "$1"\n');
+    await chmod(join(dir, path), 0o755);
+  }
+  await writeFile(join(dir, "sub", "package.json"), JSON.stringify({ scripts: { clean: 'rm -rf "$1"' } }));
+  await writeFile(join(dir, "push.sh"), "git push origin main\n");
+  return dir;
+};
+const labels = (command: string, dir: string) => scriptSources(command, dir).map(source => source.source);
+
+test("scriptSources reads a script run inside a compound command, a substitution, -c, stdin, or a wrapper, and labels it", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const [command, label] of [
+      ["(sh a.sh x)", "a.sh"],
+      ["{ sh a.sh x; }", "a.sh"],
+      ["if sh a.sh x; then :; fi", "a.sh"],
+      ["if false; then :; else sh a.sh x; fi", "a.sh"],
+      ["for i in 1; do sh a.sh x; done", "a.sh"],
+      ["case x in x)sh a.sh x;esac", "a.sh"],
+      ["f() { sh a.sh x; }; f", "a.sh"],
+      ["function f { sh a.sh x; }; f", "a.sh"],
+      ["! sh a.sh x", "a.sh"],
+      ["{ ./a.sh x; }", "./a.sh"],
+      ["(set -- x; . ./a.sh)", "./a.sh"],
+      ["out=$(sh a.sh x)", "a.sh"],
+      ["out=`sh a.sh x`", "a.sh"],
+      ["diff <(sh a.sh x) /dev/null", "a.sh"],
+      ["(cd sub && sh a.sh x)", "sub/a.sh"],
+      ["bash -lc 'cd sub && sh a.sh x'", "sub/a.sh"],
+      ["sh -c './a.sh x'", "./a.sh"],
+      ['eval "sh a.sh x"', "a.sh"],
+      ['sh "a.sh" x', "a.sh"],
+      ['"./a.sh" x', "./a.sh"],
+      ['set -- x; source "a.sh"', "a.sh"],
+      ["sh < a.sh", "a.sh"],
+      ["< a.sh bash", "a.sh"],
+      ["bash -s x < a.sh", "a.sh"],
+      ["cat a.sh | sh", "a.sh"],
+      ["cat a.sh | bash -s x", "a.sh"],
+      ["bash <(cat a.sh)", "a.sh"],
+      ["source <(cat a.sh)", "a.sh"],
+      ["timeout 5 sh a.sh x", "a.sh"],
+      ["nice -n 5 sh a.sh x", "a.sh"],
+      ["env -i PATH=/usr/bin:/bin sh a.sh x", "a.sh"],
+      ["echo x | xargs sh a.sh", "a.sh"],
+      ["(cd sub && npm run clean)", "npm run clean"],
+      ['cat <("./a.sh" x)', "./a.sh"],
+      ['echo "$("./a.sh" x)"', "./a.sh"],
+      ["((cd sub && sh a.sh x))", "sub/a.sh"],
+      ["cat <<'EOF' | bash\nsh a.sh x\nEOF", "a.sh"],
+    ] as const) assert.deepEqual(labels(command, dir), [label], command);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("scriptSources reads no script where bash runs none, and follows a cd only in its own subshell", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const command of ['echo "(sh a.sh x)"', "bash -c 'echo sh a.sh x'", "cat a.sh | grep x", "(cd sub && cat a.sh)", "if [ -f a.sh ]; then echo found; fi"]) {
+      assert.deepEqual(labels(command, dir), [], command);
+    }
+    assert.deepEqual(labels("sh a.sh < sub/a.sh", dir), ["a.sh"], "a named file runs; the file on stdin is its input");
+    assert.deepEqual(labels("(cd sub) && sh a.sh x", dir), ["a.sh"], "a cd in a subshell does not move the command after it");
+    assert.deepEqual(labels("cd sub | true; sh a.sh x", dir), ["a.sh"], "a cd in a pipeline does not move the command after it");
+    // `&` puts the whole and-or list, or the compound command before it, in a subshell of its own.
+    for (const command of ["cd sub && true & sh a.sh x", "command cd sub || true & sh a.sh x", "{ cd sub; } & sh a.sh x", "if true; then cd sub; fi & sh a.sh x"]) {
+      assert.deepEqual(labels(command, dir), ["a.sh"], command);
+    }
+    for (const command of ["cd sub; cd .. && true & ./a.sh x", "{ cd sub; cd .. && true & ./a.sh x; }"]) {
+      assert.deepEqual(labels(command, dir), ["sub/a.sh"], command);
+    }
+    assert.deepEqual(labels("sh a.sh x; cd sub && sh a.sh x", dir), ["a.sh", "sub/a.sh"], "each directory's script is read");
+    // A cd that may be skipped leaves both directories possible; one that always runs fails only on a missing target.
+    for (const command of ["false && cd sub; ./a.sh x", "if true; then cd sub; fi; ./a.sh x", "f() { cd sub; }; ./a.sh x"]) {
+      assert.deepEqual(labels(command, dir), ["sub/a.sh", "./a.sh"], command);
+    }
+    assert.deepEqual(labels("cd sub; ./a.sh x", dir), ["sub/a.sh"], "an unconditional cd to a directory that exists");
+    assert.deepEqual(labels("cd missing; ./a.sh x", dir), ["./a.sh"], "a cd to a missing directory fails and stays");
+    assert.deepEqual(labels("cat > notes.txt <<'EOF'\nsh a.sh x\nEOF", dir), [], "a heredoc written to a file runs nothing");
+    assert.deepEqual(labels("cat > notes.txt <<EOF\n$(sh a.sh x)\nEOF", dir), ["a.sh"], "a substitution in an unquoted heredoc runs");
+    // A wrapper execs a program, so a builtin after it changes nothing in this shell.
+    assert.deepEqual(labels("timeout 5 cd sub; sh a.sh x", dir), ["a.sh"], "timeout 5 cd runs no builtin cd");
+    assert.deepEqual(labels("nice -n 5 . ./a.sh", dir), [], "nice . runs no builtin source");
+    assert.deepEqual(labels("builtin cd sub && sh a.sh x", dir), ["sub/a.sh"], "builtin cd is the builtin");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a branch or a function the floor does not evaluate is still read: the floor fails closed", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const command of ["if false; then sh a.sh x; fi", "f() { sh a.sh x; }", "false && sh a.sh x"]) {
+      assert.ok(bodyIds(command, dir).includes("rm-recursive-dangerous-target (via a.sh)"), `${command}: ${bodyIds(command, dir).join(", ")}`);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("source <(cat FILE) is held: bash 4 and later run it, though bash 3.2 runs nothing from it", async () => {
+  const dir = await shapesProject();
+  try {
+    assert.deepEqual(bodyIds("source <(cat a.sh)", dir), ["rm-recursive-dangerous-target (via a.sh)"]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a delete is read by the command word bash runs: quoted, escaped, a path, an empty expansion, or after a case pattern", async () => {
+  const del = ["r", "m"].join("");
+  for (const command of [`\\${del} -rf ~`, `"${del}" -rf ~`, `r''m -rf ~`, `/bin/${del} -rf ~`, `\${x}${del} -rf ~`, `sudo /bin/${del} -rf ~`,
+    `case x in x)${del} -rf ~;; esac`, `bash -c '/bin/${del} -rf ~'`, `(cd /tmp && "${del}" -rf ~)`, `out=$(\\${del} -rf ~)`]) {
+    assert.ok(matchPatterns("bash", { command }, cwd).some(hit => hit.id === "rm-recursive-dangerous-target"), command);
+  }
+  for (const command of [`echo "/bin/${del} -rf ~"`, `echo /bin/${del} -rf ~`, `grep '"${del}" -rf' notes.txt`]) {
+    assert.ok(!matchPatterns("bash", { command }, cwd).some(hit => hit.id === "rm-recursive-dangerous-target"), command);
+  }
+  // A user rule reads the command as typed: the plain `rm` is only for the delete classifier.
+  const commandRules = [{ id: "bin-rm", pattern: `/bin/${del}\\b`, severity: "confirm" as const }];
+  assert.ok(matchPatterns("bash", { command: `/bin/${del} -rf build` }, cwd, { commandRules }).some(hit => hit.id === "bin-rm"));
+});
+
+test("script_lines carries a body delete written as /bin/rm", async () => {
+  const dir = await shapesProject();
+  try {
+    await writeFile(join(dir, "b.sh"), `#!/bin/sh\n/bin/${["r", "m"].join("")} -rf ~\n`);
+    const judge = judgeOf();
+    await evaluateAction({ tool: "bash", input: { command: "(sh b.sh)" }, cwd: dir, task: "run it" }, { config: { ...defaultConfig().action, traceSample: 0 }, judge });
+    assert.equal(judge.calls.length, 1);
+    assert.match(String(judge.calls[0]!.state.script_lines), /\/bin\/rm -rf ~/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("the ask gate asks for a push in a script run inside a subshell, and not for a cat of it", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const [command, requests] of [["(sh push.sh)", 1], ["(cat push.sh)", 0]] as const) {
+      const decision = actionAskGate("bash", { command }, stripDataText(command).text, dir);
+      if (requests) assert.match(decision.why, /^runs a script with /, command);
+      const judge = judgeOf();
+      await evaluateAction({ tool: "bash", input: { command }, cwd: dir, task: "run it" }, { config: { ...defaultConfig().action, traceSample: 0 }, judge });
+      assert.equal(judge.calls.length, requests, command);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// --- Deep nesting, the roots rule, a quoted ~, and the other ways a shell is fed its code ---------
+
+const DEL = `${["r", "m"].join("")} -rf ~`;
+const parens = (n: number, inner: string) => "( ".repeat(n) + inner + " )".repeat(n);
+/** Each construct the reader enters, nested `n` deep around `inner`. */
+const nestings = (n: number, inner: string): Record<string, string> => ({
+  "( )": parens(n, inner),
+  "(( ))": "((".repeat(n) + inner + "))".repeat(n),
+  "$( )": "echo " + "$(".repeat(n) + inner + ")".repeat(n),
+  "backticks inside $( )": "echo " + "$(`".repeat(n / 2) + inner + "`)".repeat(n / 2),
+  "<( )": "cat " + "<(true; cat ".repeat(n) + `<(${inner})` + ")".repeat(n),
+  "{ }": "{ ".repeat(n) + `${inner};` + " }".repeat(n),
+  "if": "if true; then ".repeat(n) + `${inner};` + " fi;".repeat(n),
+  "case": "case x in x) ".repeat(n) + inner + " ;; esac".repeat(n),
+  "${ }": "echo " + "${x:-".repeat(n) + `$(${inner}; true)` + "}".repeat(n),
+  "\"$( )\"": "echo " + "\"$(echo ".repeat(n) + inner + ")\"".repeat(n),
+  "an array of $( )": "a=($(".repeat(n) + inner + "))".repeat(n),
+  "find -exec": "find . -exec ".repeat(n) + inner + " \\;".repeat(n),
+  "a -c string inside": `sh -c '${parens(n, inner)}'`,
+  "a -c string innermost": parens(n, `sh -c '${inner}'`),
+  "eval inside": `eval '${parens(n, inner)}'`,
+  "eval innermost": parens(n, `eval '${inner}'`),
+  "a heredoc fed to a shell inside": `sh <<'EOF'\n${parens(n, inner)}\nEOF`,
+  "a heredoc fed to a shell innermost": "(".repeat(n) + `sh <<'EOF'\n${inner}\nEOF\n` + ")".repeat(n),
+  "env -S innermost": parens(n, `env -S '${inner}'`),
+  "an unclosed (": "(".repeat(n) + inner,
+  "an unclosed ((": "((".repeat(n) + inner,
+});
+const destructive = (hits: readonly PatternHit[]) => hits.some(hit => hit.severity === "destructive");
+
+test("a delete nested 10,000 deep in any construct is held, and nothing the floor runs throws", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-warden-deep-"));
+  try {
+    for (const [name, command] of Object.entries(nestings(10_000, DEL))) {
+      assert.ok(destructive(matchPatterns("bash", { command }, dir)), `${name}: the floor holds it`);
+      assert.doesNotThrow(() => scriptSources(command, dir), name);
+      assert.doesNotThrow(() => actionAskGate("bash", { command }, stripDataText(command).text, dir), name);
+    }
+    // The same texts 2,000 deep as script bodies, under the 64 KB limit: the script search reads them, and script_lines
+    // reaches the request.
+    for (const [name, command] of Object.entries(nestings(2_000, DEL))) {
+      await writeFile(join(dir, "deep.sh"), `${command}\n`);
+      assert.ok(destructive(matchPatterns("bash", { command: "sh deep.sh" }, dir)), `${name}: the floor holds the body`);
+      const judge = judgeOf();
+      await evaluateAction({ tool: "bash", input: { command: "sh deep.sh" }, cwd: dir, task: "run it" }, { config: { ...defaultConfig().action, traceSample: 0 }, judge });
+      assert.equal(judge.calls.length, 1, name);
+      assert.ok(judge.calls[0]!.state.script_lines, `${name}: script_lines is present`);
+    }
+    const heredocs = `${"cat <<E\nx\nE\n".repeat(80_000)}${DEL}\n`;
+    assert.ok(destructive(matchPatterns("bash", { command: heredocs }, dir)), "80,000 heredocs, then a delete");
+    assert.doesNotThrow(() => scriptSources(heredocs, dir));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a stray fi or done throws nowhere, holds nothing alone, and keeps a delete or a push after it in reach", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-warden-stray-"));
+  try {
+    // Bash rejects these as syntax errors; inside a function, a case arm, or braces the closer has nothing of its own to close.
+    const strays = ["fi; ", "fi\n", "done; ", "done\n", "f() { done; }; ", "case x in x) fi;; esac; ", "{ fi; }; ", "if true; then done; fi; "];
+    for (const stray of strays) {
+      const command = `${stray}ls`;
+      assert.equal(destructive(matchPatterns("bash", { command }, dir)), false, command);
+      assert.doesNotThrow(() => scriptSources(command, dir), command);
+      assert.ok(destructive(matchPatterns("bash", { command: `${stray}${DEL}` }, dir)), `${stray}${DEL}`);
+      assert.equal(actionAskGate("bash", { command: `${stray}git push` }, stripDataText(`${stray}git push`).text, dir).ask, true, `${stray}git push`);
+    }
+    await writeFile(join(dir, "stray.sh"), `fi\n${DEL}\n`);
+    assert.ok(destructive(matchPatterns("bash", { command: "sh stray.sh" }, dir)), "a body whose first line is fi");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+/** The paths a run asks the file system about. */
+const fsPaths = (run: () => void): string[] => {
+  const calls: string[] = [];
+  const names = ["statSync", "lstatSync", "realpathSync", "readFileSync", "existsSync", "readdirSync", "openSync", "accessSync", "readlinkSync"] as const;
+  const originals = names.map(name => fs[name]);
+  names.forEach((name, index) => {
+    const original = originals[index] as (...args: unknown[]) => unknown;
+    const wrapped = function (this: unknown, path: unknown, ...rest: unknown[]) { calls.push(String(path)); return original.call(this, path, ...rest); };
+    if ("native" in original) Object.assign(wrapped, { native: original.native });
+    (fs as unknown as Record<string, unknown>)[name] = wrapped;
+  });
+  syncBuiltinESMExports();
+  try { run(); } finally {
+    names.forEach((name, index) => { (fs as unknown as Record<string, unknown>)[name] = originals[index]; });
+    syncBuiltinESMExports();
+  }
+  return calls;
+};
+
+test("a path that dots out of a root, or names stdin, never reaches the file system", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-warden-roots-"));
+  try {
+    await writeFile(join(dir, "a.sh"), "echo ok\n");
+    const roots = [dir, "/tmp", "/private/tmp", "/var/folders", "/private/var/folders", tmpdir()];
+    for (const command of ["sh /tmp/../net/x/a.sh", "sh /private/tmp/../../Volumes/x/a.sh", "source /tmp/../net/x/a.sh", "cat /tmp/../net/x/a.sh | sh", "sh ~/../../net/x/a.sh",
+      "cd /tmp/../net/x; sh a.sh", "sh /dev/stdin < a.sh", "sh /dev/stdin", "bash /dev/fd/0 < a.sh", ". /dev/stdin < a.sh"]) {
+      const outside = fsPaths(() => { scriptSources(command, dir); matchPatterns("bash", { command }, dir); })
+        .map(path => resolve(dir, path)).filter(path => !roots.some(root => path === root || path.startsWith(`${root}/`)));
+      assert.deepEqual(outside, [], command);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("a quoted ~ is not expanded: bash looks for a folder named ~", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-warden-tilde-"));
+  const home = process.env.HOME;
+  try {
+    await mkdir(join(dir, "home"));
+    await mkdir(join(dir, "proj"));
+    await writeFile(join(dir, "home", "h.sh"), `#!/bin/sh\n${DEL}\n`);
+    process.env.HOME = join(dir, "home");
+    const proj = join(dir, "proj");
+    for (const command of ['source "~/h.sh"', '. "~/h.sh"', "sh '~/h.sh'", 'sh "~/h.sh"', 'cd "~" && sh h.sh', "cd '~'; ./h.sh"]) {
+      assert.deepEqual(labels(command, proj), [], command);
+    }
+    assert.deepEqual(labels("source ~/h.sh", proj), ["~/h.sh"], "an unquoted ~ is the home folder");
+    assert.deepEqual(labels("cd ~ && sh h.sh", proj).length, 1, "cd ~ moves to the home folder");
+  } finally {
+    process.env.HOME = home;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("C1: a script fed on stdin by cat < FILE or read from /dev/stdin is read from the < file", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const command of ["cat < a.sh | sh", "cat < a.sh | bash -s x", "sh /dev/stdin < a.sh", "bash /dev/stdin < a.sh", "bash /dev/fd/0 < a.sh",
+      "source /dev/stdin < a.sh", ". /dev/stdin < a.sh", "cat a.sh | sh /dev/stdin"]) assert.deepEqual(labels(command, dir), ["a.sh"], command);
+    assert.deepEqual(labels("cat a.sh | cat | sh", dir), [], "a second program between the file and the shell stays unread");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C2: a file's text run as code by -c, eval, or a here-string is read as a script", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const command of ['sh -c "$(cat a.sh)"', 'bash -c "$(< a.sh)"', 'eval "$(cat a.sh)"', 'eval "$(< a.sh)"', 'sh <<< "$(cat a.sh)"',
+      'sh -c "`cat a.sh`"', 'eval "`cat a.sh`"']) assert.deepEqual(labels(command, dir), ["a.sh"], command);
+    assert.deepEqual(labels('echo "$(cat a.sh)"', dir), [], "a file's text printed is not code");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C3: the string of env -S is read as a command line", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const command of ["env -S 'sh a.sh x'", "env -S'sh a.sh x'", "env --split-string='sh a.sh x'", "env --split-string 'sh a.sh x'", "env -i -S 'sh a.sh' x"]) {
+      assert.deepEqual(labels(command, dir), ["a.sh"], command);
+    }
+    assert.ok(destructive(matchPatterns("bash", { command: `env -S '\\${DEL}'` }, dir)), "a delete in the string");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C4: the command of find -exec, -execdir, -ok, and -okdir is read up to its terminator", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const command of ["find . -exec ./a.sh \\;", "find . -exec ./a.sh ';'", "find . -name a.sh -exec ./a.sh {} +", "find . -execdir ./a.sh \\;",
+      "find . -ok ./a.sh \\;", "find . -okdir ./a.sh \\;", "find . -exec sh a.sh \\; -print"]) {
+      assert.deepEqual(labels(command, dir), [command.includes("sh a.sh") ? "a.sh" : "./a.sh"], command);
+    }
+    assert.deepEqual(labels("find . -name a.sh -exec sh {} \\;", dir), [], "a {} operand is not a literal path");
+    assert.ok(destructive(matchPatterns("bash", { command: `find . -exec sh -c '\\${DEL}' \\;` }, dir)), "a delete in a -c string of -exec");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C5: a substitution inside an array assignment runs", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const command of ["arr=($(sh a.sh x))", "declare -a arr=(1 $(sh a.sh x) 3)", "f() { local arr=($(sh a.sh x)); }; f", "arr=(\"$(sh a.sh x)\")"]) {
+      assert.deepEqual(labels(command, dir), ["a.sh"], command);
+    }
+    assert.deepEqual(labels("arr=(sh a.sh x)", dir), [], "array elements are words, not a command");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C6: a heredoc whose end line closes the substitution is held: bash 3.2 and 5 run it, dash does not", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const command of [`x=$(sh <<EOF\n${DEL}\nEOF)`, `cat <(sh <<EOF\n${DEL}\nEOF) >/dev/null`]) {
+      assert.ok(destructive(matchPatterns("bash", { command }, dir)), command);
+    }
+    assert.deepEqual(labels("x=$(sh <<EOF\nsh a.sh x\nEOF)", dir), ["a.sh"]);
+    assert.deepEqual(labels("cat <(bash <<EOF\nsh a.sh x\nEOF) >/dev/null", dir), ["a.sh"]);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("C7: a delete word written \\rm, \"rm\", r''m, /bin/rm, or ${x}rm inside a -c string, eval, or a heredoc in one is held", () => {
+  const word = ["r", "m"].join("");
+  for (const command of [`sh -c '\\${word} -rf ~'`, `sh -c "\\"${word}\\" -rf ~"`, `sh -c "\\\\${word} -rf ~"`, `eval '\\${word} -rf ~'`, `eval "\\"${word}\\" -rf ~"`,
+    `bash -c 'sh -c '\\''\\${word} -rf ~'\\'''`, `sh -c "r''m -rf ~"`, `eval 'r""m -rf ~'`, `sh -c "/bin/${word} -rf \\"\\$HOME\\""`, `eval '\${x}${word} -rf ~'`,
+    `bash -c "sh <<EOF\n\\\\${word} -rf ~\nEOF"`]) {
+    assert.ok(destructive(matchPatterns("bash", { command }, cwd)), command);
+  }
+  assert.ok(!destructive(matchPatterns("bash", { command: `sh -c 'echo \\${word} -rf ~'` }, cwd)), "an echo of the delete runs none");
+});
+
+test("the ask gate asks for a push fed to a shell on stdin, by env -S, as a file's text, or in an array's substitution", async () => {
+  const dir = await shapesProject();
+  try {
+    for (const command of ["cat < push.sh | sh", "env -S 'sh push.sh'", 'sh -c "$(cat push.sh)"', "arr=($(sh push.sh))", "sh /dev/stdin < push.sh"]) {
+      const decision = actionAskGate("bash", { command }, stripDataText(command).text, dir);
+      assert.match(decision.why, /^runs a script with /, command);
+      const judge = judgeOf();
+      await evaluateAction({ tool: "bash", input: { command }, cwd: dir, task: "run it" }, { config: { ...defaultConfig().action, traceSample: 0 }, judge });
+      assert.equal(judge.calls.length, 1, command);
+    }
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
