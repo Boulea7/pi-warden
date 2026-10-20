@@ -54,9 +54,9 @@ Most guardrails stop and ask you. pi-warden tells **the agent** what it got wron
 
 `/warden improve` looks at the last seven days of this project's own sessions, rules log and hold log, and prints what actually cost you: whole-file reads and calls per turn, tool calls the waste detectors flag as repeats, requests typed twice, and the same refusal, rule by rule.
 
-Then it proposes at most three edits to `pi-warden.md`, each naming the count it came from and the files it read. With nothing supported it writes nothing and says the rules held, with the counts that show it. A proposal that cites a number the pass did not print is refused.
+Then it hands the judging to the model already running in this session. The model reads the sessions behind those numbers and edits `pi-warden.md`: at most three changes, each with a `Measured` line naming the count it came from and the session file. With nothing supported it changes nothing and says the rules held, with the counts that show it; when no rule was judged in the window it says that instead, because nothing is known about the rules then.
 
-A confirmed run writes a timestamped backup first, then the file, and refuses a file that changed under it. The counts, the backup and the write are local: no extra key and no TypeSafe request. `/warden improve 4` reads four days; the range is 1 to 90.
+A run writes a timestamped backup before the model's turn, then prints every rule added, changed or removed with the count it cited, and the diff. The counts, the backup and the checks are local: no extra key, no TypeSafe request, and the only cost is that one turn of the session model. `/warden improve 4` reads four days; the range is 1 to 90.
 
 While the pass runs, the rules judge goes quiet in that one session, so the rewrite is not graded against the rules it is rewriting. The window expires by the clock, another Pi session keeps judging, and the destructive floor stays on.
 
@@ -127,7 +127,7 @@ Jev requests cost money, so each 1.0 change was measured by what it saves. Each 
 | Approval on demand ([#160](https://github.com/DevMortimer/pi-warden/pull/160), [#161](https://github.com/DevMortimer/pi-warden/pull/161)) | Approval questions per 1,000 judged calls 90.0 → 0.7; wrong releases 45 → 1 in the measured runs | [Approval on demand](docs/guards.md#approval-on-demand-2026-10-01-three-designs-three-sets) |
 | Hold database ([#149](https://github.com/DevMortimer/pi-warden/pull/149)) | A copy of 52,362 rows shrinks from 285.9 MiB to 41.6 MiB | [Data handling](docs/data-handling.md#what-stays-on-this-machine) |
 
-Features that did not earn their cost did not ship: the working-memory pruning, the stale-result stubs, and a hybrid compaction failed their gates, and the off-task and should-proceed steers stay trace-only. The numbers are in the [Calibration](docs/guards.md#calibration) section. `/warden improve` and `/warden report` send no request at all.
+Features that did not earn their cost did not ship: the working-memory pruning, the stale-result stubs, and a hybrid compaction failed their gates, and the off-task and should-proceed steers stay trace-only. The numbers are in the [Calibration](docs/guards.md#calibration) section. `/warden report` sends no request at all; `/warden improve` spends one turn of the session model and no TypeSafe request.
 
 ## Rules no linter can check
 
