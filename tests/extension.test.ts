@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, beforeEach, test, type TestContext } from "node:test";
 import { createEventBus, DefaultResourceLoader, SettingsManager, type EventBus } from "@earendil-works/pi-coding-agent";
@@ -11,7 +11,7 @@ import { createTypeSafe } from "pi-typesafe";
 import type { Extension, ExtensionContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
 import { initSchema, queryHoldsForProject, recordCause } from "../src/learning.js";
 import { readRulesLog, rulesLogPath } from "../src/rules-log.js";
-import { defaultConfig, loadConfig } from "../src/config.js";
+import { defaultConfig, loadConfig, loosenRecordPath } from "../src/config.js";
 import { policyMatches, CONSCIENCE_BETA_POLICY } from "../src/load.js";
 import { _testSetIndexRunning, askedBeforeReply, assistantPlan } from "../src/extension.js";
 import { SHELL_RULES_CHECKS } from "../src/turn-rules.js";
@@ -194,10 +194,12 @@ const settleBackground = (): Promise<void> => new Promise(resolve => setTimeout(
  * the judge, and no trace-only sample rides a second request. `tests/action-cut.test.ts` covers those on their own.
  */
 const FULL_ACTION = { ask: { enabled: false }, traceSample: 0 };
-/** Writes the user config from JSON, with the pre-cut action section unless the test sets its own. */
-const writeConfig = (json: string) => {
+/** Writes the user config from JSON, with the pre-cut action section unless the test sets its own, then starts the
+ *  session that reads it: a user config edit lands at the next session, so a test that changes one starts a session. */
+const writeConfig = async (json: string) => {
   const config = JSON.parse(json) as { action?: Record<string, unknown> };
-  return writeFile(configPath(), JSON.stringify({ ...config, action: { ...FULL_ACTION, ...(config.action ?? {}) } }));
+  await writeFile(configPath(), JSON.stringify({ ...config, action: { ...FULL_ACTION, ...(config.action ?? {}) } }));
+  await sessionStart();
 };
 const grantConsent = () => writeConfig(JSON.stringify({ typesafe: true, notices: true, rules: { enabled: false }, cause: { enabled: false }, ...STACK_BAR }));
 /** Consent with the cause-check at its default (on), for tests whose subject is that guard. */
@@ -923,7 +925,8 @@ test("subagent reports: silent append by default, one batched wake for a report 
   await runCommand("status");
   assert.match(notices.at(-1)!.text, /subagent triage/);
   assert.match(notices.at(-1)!.text, /1\/4 subagent reports woken/);
-  await writeConfig(JSON.stringify({  typesafe: true, subagent: { cooldownMs: 0 } , ...STACK_BAR }));
+  // The window is cleared through pi-warden's own write, which applies at once and keeps the waiting report.
+  await runCommand("config set subagent.cooldownMs 0");
   await settled(branch(entry("e5", "subagent-notify", failure.replace("explorer", "builder"))));
   assert.equal(requests.length, 3);
   const batched = sentMessages.filter(sent => sent.message.customType === "pi-warden-steer");
@@ -2014,6 +2017,11 @@ test("rules: a write in a project with pi-warden.md gets its own request beside 
   const readme = join(temporary, "README.md");
   try {
     await writeFile(rulesFile, "# No console statements\nCode must not contain `console.log`.\n\n# Tests for exports\npaths: src/**\nEvery exported function needs a test.\n");
+    // A session reads its project file once, when it starts, so this one is written before the session's judged calls.
+    await mkdir(join(temporary, ".pi"), { recursive: true });
+    await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ rules: { exclude: ["secrets/**"], sensitivePaths: { "migrations/**": "Tell the user this touches a migration" } } }));
+    await sessionStart();
+    requests.length = 0;
     nextAnswers = { irreversible: 0.05, off_task: 0.05, scope: "expected_step", slop_stub: 0.92, slop_hedging: 0.1, slop_comments: 0.1, slop_dead: 0.1, "rule_no-console-statements": "violation" };
     assert.equal(await toolCall("write", { path: join(temporary, "src", "r.ts"), content: "export const r = () => { console.log(1); return null; };" }), undefined);
     assert.equal(requests.length, 2, "action request plus rules request");
@@ -2040,8 +2048,6 @@ test("rules: a write in a project with pi-warden.md gets its own request beside 
     requests.length = 0;
     await toolCall("write", { path: join(temporary, "docs", "guide.md"), content: "console.log in prose" });
     assert.deepEqual(Object.keys(requests.find(request => "rule_no-console-statements" in request.questions)!.questions), ["rule_no-console-statements"]);
-    await mkdir(join(temporary, ".pi"), { recursive: true });
-    await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ rules: { exclude: ["secrets/**"], sensitivePaths: { "migrations/**": "Tell the user this touches a migration" } } }));
     requests.length = 0;
     await toolCall("write", { path: join(temporary, "secrets", "keys.ts"), content: "export const k = 1;" });
     assert.equal(requests.filter(request => Object.keys(request.questions).some(key => key.startsWith("rule_"))).length, 0, "excluded path: no rules request");
@@ -2068,6 +2074,7 @@ test("rules: a write in a project with pi-warden.md gets its own request beside 
     assert.match(String(aggregate.state.rules), /Never commit console\.log/);
     assert.match(sentMessages.at(-1)!.message.content, /breaks a project rule: "the project's README\.md" \(0\.80\)/);
     await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ rules: { fallback: false } }));
+    await sessionStart();
     requests.length = 0;
     await toolCall("write", { path: join(temporary, "src", "g.ts"), content: "console.log(3)" });
     assert.equal(requests.filter(request => "rules" in request.questions).length, 0);
@@ -2078,6 +2085,7 @@ test("rules: a write in a project with pi-warden.md gets its own request beside 
     // the writes above spent this run's three notices.
     await rm(configPath(), { force: true });
     await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ rules: { sensitivePaths: { "**/permissions*": "Ask for a security review" } } }));
+    await sessionStart();
     await newPrompt("add the permissions helper");
     requests.length = 0; networkCalls = 0;
     await toolCall("write", { path: join(temporary, "src", "auth", "permissions.ts"), content: "export const can = () => true;" });
@@ -2711,6 +2719,8 @@ test("a trusted project file can tune thresholds but an untrusted one is ignored
   await grantConsent();
   await mkdir(join(temporary, ".pi"), { recursive: true });
   await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ action: { irreversible: { warn: 0.1, confirm: 0.2 } } }));
+  // A session reads its project file once, when it starts; this file is written before that read.
+  await sessionStart();
   try {
     nextAnswers = { irreversible: 0.3, off_task: 0.1, scope: "expected_step" };
     assert.equal((await toolCall("bash", { command: "npm test" }))?.block, true, "project thresholds apply when trusted");
@@ -3299,7 +3309,6 @@ test("user command rules: a dialog rule prompts even in advise mode, where nothi
 
 test("user command rules: an unknown severity holds for the user, and its config warning shows once per session and in /warden status", async () => {
   await writeConfig(JSON.stringify({ action: { commandRules: [{ id: "prod-deploy", pattern: "\\bdeploy\\s+prod\\b", severity: "blok" }] }, ...STACK_BAR }));
-  await sessionStart();
   const warning = /^warden: config warnings: command rule "prod-deploy": severity "blok" is not one of warn, confirm, deny, block; the rule applies at confirm$/;
   assert.deepEqual(notices.filter(notice => warning.test(notice.text)).map(notice => notice.level), ["warning"], "said once at session start");
   confirmResult = false;
@@ -4334,7 +4343,8 @@ test("session_before_compact: no consent, a skipped provider, a judge failure, o
   await writeConfig(JSON.stringify({ compaction: { enabled: true }, ...STACK_BAR }));
   assert.equal(await fire("session_before_compact", beforeCompact()), undefined);
   assert.equal(networkCalls, 0, "no consent: nothing is sent");
-  await writeConfig(JSON.stringify({ typesafe: true, compaction: { enabled: true }, ...STACK_BAR }));
+  // Consent arrives through pi-warden's own command, which applies at once: a file edit would wait for the next session.
+  await runCommand("config set typesafe true");
   assert.equal(await fire("session_before_compact", beforeCompact(), context({ model: { provider: "claude-bridge", id: "m" } })), undefined);
   assert.equal(networkCalls, 0, "a provider in skipProviders keeps its own compaction");
   failNetwork = true;
@@ -4957,14 +4967,15 @@ test("the trace file's session line carries the judgment state and a later chang
     await sessionStart();
     await rm(join(temporary, "agent", "pi-typesafe"), { recursive: true, force: true });
     await toolCall("bash", { command: "npm test" });
-    const records = await readLog(join(traceDir, `${process.pid}.jsonl`), 3, false);
-    assert.deepEqual(records.map(record => [record.kind, record.judgments]), [["session", "off:key_rejected"], ["judgments", "on"], ["entry", undefined]]);
+    // Consent was granted by a config write, which starts the session that reads it: one session record of its own.
+    const records = await readLog(join(traceDir, `${process.pid}.jsonl`), 4, false);
+    assert.deepEqual(records.slice(1).map(record => [record.kind, record.judgments]), [["session", "off:key_rejected"], ["judgments", "on"], ["entry", undefined]]);
 
     await rm(configPath(), { force: true });
     await sessionStart();
     await toolCall("bash", { command: "npm test" });
-    const next = await readLog(join(traceDir, `${process.pid}.jsonl`), 5, false);
-    assert.deepEqual(next.slice(3).map(record => [record.kind, record.judgments]), [["session", "off:no_consent"], ["entry", undefined]], "no judgments line while the state holds");
+    const next = await readLog(join(traceDir, `${process.pid}.jsonl`), 6, false);
+    assert.deepEqual(next.slice(4).map(record => [record.kind, record.judgments]), [["session", "off:no_consent"], ["entry", undefined]], "no judgments line while the state holds");
   } finally {
     delete process.env.PI_WARDEN_TRACE_DIR;
   }
@@ -6201,4 +6212,244 @@ test("cause-check: a repeated unchecked cause is steered harder with the earlier
   await agentEnd("The alert is probably still from a manual edit.");
   assert.equal(sentMessages.length, 1);
   assert.match(sentMessages[0]!.message.content, new RegExp(new Date(at).toISOString().slice(0, 10)));
+});
+
+// --- pi-warden's own config: the write is held, the file is read once per session, a loosened set shows once ---
+
+const projectConfig = () => join(temporary, ".pi", "pi-warden.json");
+const clearProjectConfig = async () => { await rm(projectConfig(), { force: true }); await rm(loosenRecordPath(temporary), { force: true }); };
+
+test("a write to pi-warden's own config is held with no UI, and reading it or writing the rules file still runs", async () => {
+  await writeConfig(JSON.stringify({ notices: true, rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const headless = context({ hasUI: false });
+  const heredoc = await toolCall("bash", { command: "cat > .pi/pi-warden.json <<'EOF'\n{\"done\":{\"enabled\":false}}\nEOF" }, headless);
+  assert.equal(heredoc?.block, true, "the heredoc is held");
+  assert.match(heredoc!.reason!, /pi-warden's own config/);
+  assert.match(heredoc!.reason!, /\.pi\/pi-warden\.json/);
+  assert.equal(existsSync(projectConfig()), false, "nothing was written");
+  const direct = await toolCall("write", { path: projectConfig(), content: "{}" }, headless);
+  assert.equal(direct?.block, true, "the write tool is held");
+  const userFile = await toolCall("edit", { path: join(process.env.PI_CODING_AGENT_DIR!, "pi-warden", "config.json") }, headless);
+  assert.equal(userFile?.block, true, "pi-warden's own user config is held too");
+  assert.equal(await toolCall("bash", { command: "cat .pi/pi-warden.json" }, headless), undefined, "a read is free");
+  assert.equal(await toolCall("write", { path: join(temporary, "pi-warden.md"), content: "# rules\n" }, headless), undefined, "the rules file is free");
+  assert.equal(await toolCall("write", { path: join(temporary, ".pi", "settings.json"), content: "{}" }, headless), undefined, "another .pi file is free");
+  await clearProjectConfig();
+});
+
+test("with a UI, confirm mode asks the user before a write to pi-warden's own config", async () => {
+  await writeConfig(JSON.stringify({ mode: "confirm", rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  confirmResult = false;
+  const refused = await toolCall("write", { path: projectConfig(), content: "{}" });
+  assert.equal(refused?.block, true);
+  assert.match(confirms.at(-1)?.title ?? "", /allow this write call/);
+  assert.equal(existsSync(projectConfig()), false, "a no leaves the file alone");
+  confirmResult = true;
+  assert.equal(await toolCall("write", { path: projectConfig(), content: "{}" }), undefined, "a yes runs the call");
+  await clearProjectConfig();
+});
+
+test("the project file is read once per session: a mid-run edit lands at the next session", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  await runCommand("status");
+  assert.match(notices.at(-1)!.text, /done-check/, "the done-check is on");
+  await writeFile(projectConfig(), JSON.stringify({ done: { enabled: false } }));
+  await runCommand("status");
+  assert.match(notices.at(-1)!.text, /done-check/, "a mid-run edit does not change this session");
+  await sessionStart();
+  await runCommand("status");
+  assert.doesNotMatch(notices.at(-1)!.text, /done-check/, "the next session reads the file");
+  await clearProjectConfig();
+});
+
+test("the shell shapes that rewrote pi-warden's config in an independent check are blocked with no UI", async () => {
+  await writeConfig(JSON.stringify({ notices: true, rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const headless = context({ hasUI: false });
+  const userConfig = join(process.env.PI_CODING_AGENT_DIR!, "pi-warden", "config.json");
+  const before = await readFile(userConfig, "utf8");
+  for (const command of [
+    "bash -c 'echo {} > .pi/pi-warden.json'",
+    `cd .pi && printf '%s' '{"cause":{"enabled":false}}' > pi-warden.json`,
+    `cd ${join(process.env.PI_CODING_AGENT_DIR!, "pi-warden")} && printf '%s' '{"rules":{"enabled":false}}' > config.json`,
+    "sh -c 'printf x > .pi/pi-warden.json'",
+  ]) {
+    const result = await toolCall("bash", { command }, headless);
+    assert.equal(result?.block, true, command);
+    assert.match(result!.reason!, /pi-warden's own config/);
+  }
+  assert.equal(existsSync(projectConfig()), false, "the project file is not written");
+  assert.equal(await readFile(userConfig, "utf8"), before, "the live user config is not written");
+  await runCommand("status", headless);
+  assert.ok(notices.length > 0, "the session still answers after the attempts");
+  await clearProjectConfig();
+});
+
+test("a further loosening of an already-named check shows the line again", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const lines = () => notices.filter(notice => notice.text.startsWith("This project's"));
+  await writeFile(projectConfig(), JSON.stringify({ cause: { enabled: false } }));
+  notices.length = 0;
+  await sessionStart();
+  assert.match(lines().at(-1)!.text, /cause-check/);
+  assert.doesNotMatch(lines().at(-1)!.text, /claims-cause/);
+  // The check comes back on, raised: the name is already recorded, the detail is not, so the line shows again.
+  await writeFile(projectConfig(), JSON.stringify({ cause: { claimsCause: 0.95 } }));
+  notices.length = 0;
+  await sessionStart();
+  assert.equal(lines().length, 1);
+  assert.match(lines().at(-1)!.text, /claims-cause threshold 0\.7 → 0\.95/);
+  notices.length = 0;
+  await sessionStart();
+  assert.deepEqual(lines(), [], "the same set with the same detail stays quiet");
+  await clearProjectConfig();
+});
+
+test("a read-only agent directory does not stop a session, and the loosening line still shows", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await writeFile(projectConfig(), JSON.stringify({ done: { enabled: false } }));
+  const recordDir = dirname(loosenRecordPath(temporary));
+  await mkdir(recordDir, { recursive: true });
+  await rm(loosenRecordPath(temporary), { force: true });
+  await chmod(recordDir, 0o555);
+  try {
+    await sessionStart();
+    const lines = notices.filter(notice => notice.text.startsWith("This project's"));
+    assert.equal(lines.length, 1, "the line shows although the record cannot be written");
+    assert.match(lines[0]!.text, /done-check/);
+    await runCommand("status");
+    assert.ok(notices.length > 1, "the rest of the session still runs");
+  } finally {
+    await chmod(recordDir, 0o755);
+    await clearProjectConfig();
+  }
+});
+
+test("a loosened project file shows one line at session start, once for that set", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const lines = () => notices.filter(notice => notice.text.startsWith("This project's"));
+  assert.deepEqual(lines(), [], "nothing loosened, no line");
+  await writeFile(projectConfig(), JSON.stringify({ done: { enabled: false } }));
+  notices.length = 0;
+  await sessionStart();
+  assert.equal(lines().length, 1);
+  assert.match(lines()[0]!.text, /switches off: done-check\./);
+  notices.length = 0;
+  await sessionStart();
+  assert.deepEqual(lines(), [], "the same set stays quiet");
+  await writeFile(projectConfig(), JSON.stringify({ done: { enabled: false }, cause: { enabled: false } }));
+  notices.length = 0;
+  await sessionStart();
+  assert.equal(lines().length, 1);
+  assert.match(lines()[0]!.text, /switches off: done-check, cause-check\./);
+  await clearProjectConfig();
+});
+
+// --- both config files are read once per session: an outside edit waits, pi-warden's own write applies ---
+
+test("a user config written during the session changes nothing until the next session, and one line says so", async () => {
+  await writeConfig(JSON.stringify({ mode: "steer", rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const changes = () => notices.filter(notice => /changed during this session/.test(notice.text));
+  const current = JSON.parse(await readFile(configPath(), "utf8")) as Record<string, unknown>;
+  await writeFile(configPath(), JSON.stringify({ ...current, mode: "advise", slop: { enabled: false } }));
+  await toolResult("read", {}, "ok", false);
+  assert.equal(changes().length, 1, "one line for the edit");
+  assert.match(changes()[0]!.text, /your pi-warden config changed during this session\. The change applies at the next session \(\/new\)\./);
+  // The same new content seen again, at a tool result or at the end of the run, gives no second line.
+  await toolResult("read", {}, "ok", false);
+  await agentEnd("Report.");
+  assert.equal(changes().length, 1, "one line per new content");
+  // The running session keeps the value it started with.
+  await runCommand("mode");
+  assert.match(notices.at(-1)!.text, /Mode is steer/);
+  await sessionStart();
+  await runCommand("mode");
+  assert.match(notices.at(-1)!.text, /Mode is advise/, "the next session reads the file");
+  await clearProjectConfig();
+});
+
+test("pi-warden's own write applies at once, and it is not a change to report", async () => {
+  await writeConfig(JSON.stringify({ mode: "steer", rules: { enabled: false } }));
+  await clearProjectConfig();
+  await sessionStart();
+  const changes = () => notices.filter(notice => /changed during this session/.test(notice.text));
+  await runCommand("mode advise");
+  assert.match(notices.at(-1)!.text, /Mode set to advise/);
+  await runCommand("mode");
+  assert.match(notices.at(-1)!.text, /Mode is advise/, "the running session sees it at once");
+  await toolResult("read", {}, "ok", false);
+  await agentEnd("Report.");
+  assert.deepEqual(changes(), [], "pi-warden's own write never raises the line");
+});
+
+test("with no UI, the change line is the status message", async () => {
+  await writeConfig(JSON.stringify({ mode: "steer", rules: { enabled: false } }));
+  const headless = context({ hasUI: false });
+  await sessionStart(headless);
+  const current = JSON.parse(await readFile(configPath(), "utf8")) as Record<string, unknown>;
+  await writeFile(configPath(), JSON.stringify({ ...current, slop: { enabled: false } }));
+  await toolResult("read", {}, "ok", false, headless);
+  const line = sentMessages.filter(entry => entry.message.customType === "pi-warden-status").map(entry => entry.message.content).find(text => /changed during this session/.test(text));
+  assert.match(line ?? "", /your pi-warden config changed during this session\. The change applies at the next session \(\/new\)\./);
+});
+
+test("a project file created or removed during the session shows one line naming it", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const changes = () => notices.filter(notice => notice.text.includes("the project file .pi/pi-warden.json changed during this session"));
+  await writeFile(projectConfig(), JSON.stringify({ cause: { windowDays: 1 } }));
+  await toolResult("read", {}, "ok", false);
+  assert.equal(changes().length, 1, "a file created during the session counts");
+  await agentEnd("Report.");
+  assert.equal(changes().length, 1, "one line per new content");
+  await rm(projectConfig(), { force: true });
+  await toolResult("read", {}, "ok", false);
+  assert.equal(changes().length, 2, "a file removed during the session counts");
+  await clearProjectConfig();
+});
+
+test("a loosened set that goes away and comes back shows its line again", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  const lines = () => notices.filter(notice => notice.text.startsWith("This project's"));
+  await writeFile(projectConfig(), JSON.stringify({ cause: { windowDays: 1 } }));
+  await sessionStart();
+  assert.equal(lines().length, 1);
+  assert.match(lines()[0]!.text, /cause-check \(window days 7 → 1\)/);
+  // The loosening goes away: the empty set replaces the record, so the same set is news again when it returns.
+  await rm(projectConfig(), { force: true });
+  notices.length = 0;
+  await sessionStart();
+  assert.deepEqual(lines(), [], "nothing loosened, no line");
+  assert.deepEqual(JSON.parse(await readFile(loosenRecordPath(temporary), "utf8")), { version: 2, loosened: [] });
+  await writeFile(projectConfig(), JSON.stringify({ cause: { windowDays: 1 } }));
+  notices.length = 0;
+  await sessionStart();
+  assert.equal(lines().length, 1, "the same set coming back shows the line again");
+  await clearProjectConfig();
 });

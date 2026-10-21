@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
-import { join, resolve as pathResolve } from "node:path";
+import { join, resolve as pathResolve, relative as pathRelative } from "node:path";
 import { homedir } from "node:os";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -22,13 +22,13 @@ import type { SteerKind, SteerSubject } from "./adaptive.js";
 import type { ToolCallRef } from "./action-guard.js";
 import { ArmingTracker, unparseableArmingRules } from "./arming.js";
 import * as configModule from "./config.js";
-import { applyUserOverrides, defaultConfig, getNestedValue, isMode, loadConfig, PACKAGE_NAME, parseConfigValue, PROJECT_CONFIG_FILE, projectConfigPath, readUserConfig, setNestedValue, setUserSetting, userConfigPath, writeUserConfig } from "./config.js";
+import { applyUserOverrides, defaultConfig, getNestedValue, isMode, loadConfig, loosenNotice, loosenedChecks, readLoosenRecord, readProjectConfig, readUserConfigFile, writeLoosenRecord, PACKAGE_NAME, parseConfigValue, PROJECT_CONFIG_FILE, projectConfigPath, readUserConfig, setNestedValue, userConfigPath, writeUserConfig } from "./config.js";
 import type { WardenConfig, WardenMode } from "./config.js";
 import { checkSkipReason, classifyToolResult, doneNudge, emptyEvidence, evaluateDone, finalAssistantText, formatDone, isVisualCheck, localUrl, needsDoneCheck, projectCheckCommand, recordOutcome as recordDoneOutcome, recordUi } from "./done.js";
 import type { RunEvidence } from "./done.js";
 import { causeNudge, causePreFilter, emptyCauseActivity, evaluateCause, formatCause, recordCauseActivity } from "./cause.js";
 import type { CauseActivity, CauseStore } from "./cause.js";
-import { createdScratch, describeAsked, evaluateAction, formatVerdictTokens, higher, inertPathRules, intentSteer, largeOutputNotice, movedInTargets, offTaskSteer, pruneScratch, scratchCandidates, SCRATCH_PATHS_ENV, scratchPaths, scoreFreeReason, shouldProceedMessage, SLOP_LABELS, SteerRepeatWindow, steerReason, stripDataText, unknownExemptIds, wardenHostPaths, writeSinkTargets, isVisibleCommand } from "./guard.js";
+import { CONFIG_HOLD_ID, configWriteTargets, createdScratch, describeAsked, evaluateAction, formatVerdictTokens, higher, inertPathRules, intentSteer, largeOutputNotice, movedInTargets, offTaskSteer, pruneScratch, scratchCandidates, SCRATCH_PATHS_ENV, scratchPaths, scoreFreeReason, shouldProceedMessage, SLOP_LABELS, SteerRepeatWindow, steerReason, stripDataText, unknownExemptIds, wardenHostPaths, writeSinkTargets, isVisibleCommand } from "./guard.js";
 import type { Level, PatternHit, PreviousAction, ScratchIdentity, SlopSymptom, TaskMessage, Verdict } from "./guard.js";
 import { commandOf } from "./tools.js";
 import { mergeWrites, shellWrites } from "./shell-writes.js";
@@ -447,6 +447,55 @@ export default function wardenExtension(host: ExtensionAPI): void {
   let sessionHostPaths: string[] = [];
   // Scratch roots the host declares; set per session from PI_WARDEN_SCRATCH_PATHS.
   let sessionScratchPaths: string[] = [];
+  /** The project file read once at session start: an edit to it lands at the next session, never mid-run. */
+  let sessionProject: { cwd: string; value: unknown } | undefined;
+  /** The user file read once at session start, beside it: an outside edit lands at the next session too. */
+  let sessionUser: { value: unknown } | undefined;
+  /** The content last seen in each file, so one new content gives one line: pi-warden's own writes set them forward. */
+  let seenUser: string | undefined;
+  let seenProject: string | undefined;
+  /** A file's content as one comparable string; a missing file is its own value, so a create or a remove counts. */
+  const configKey = (value: unknown): string => JSON.stringify(value) ?? "absent";
+  /** The user layer alone, from the session's snapshot: no project file, no live read. */
+  const sessionUserConfig = (): WardenConfig => loadConfig({ dirs, userRaw: sessionUser });
+  /** A write pi-warden makes itself: its keys apply at once, and it is not an outside change to report. */
+  const userConfigWritten = (changes: ReadonlyMap<string, unknown>): void => {
+    let value: Record<string, unknown> = sessionUser?.value !== null && typeof sessionUser?.value === "object" ? { ...(sessionUser.value as Record<string, unknown>) } : {};
+    for (const [key, setting] of changes) value = setNestedValue(value, key, setting);
+    sessionUser = { value };
+    // The file now holds our write merged over what was there, so the next check sees no outside change.
+    seenUser = configKey(readUserConfigFile(dirs));
+  };
+  /** One line for each config file whose content changed during this session, once per new content. */
+  const reportConfigChanges = (ctx: ExtensionContext): void => {
+    if (sessionUser === undefined) return;
+    const line = (text: string) => {
+      const notice = `warden: ${text} The change applies at the next session (/new).`;
+      if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+      else pi.sendMessage({ customType: `${PACKAGE_NAME}-status`, content: redact(notice), display: true });
+    };
+    const user = configKey(readUserConfigFile(dirs));
+    if (user !== seenUser) {
+      seenUser = user;
+      line("your pi-warden config changed during this session.");
+    }
+    if (sessionProject) {
+      const project = configKey(readProjectConfig(sessionProject.cwd, dirs));
+      if (project !== seenProject) {
+        seenProject = project;
+        line(`the project file ${join(dirs.configDirName, PROJECT_CONFIG_FILE)} changed during this session.`);
+      }
+    }
+  };
+  /** The config for a session: both files come from the snapshot taken when the session started. */
+  const sessionConfig = (cwd: string, trusted: boolean): WardenConfig =>
+    loadConfig({ cwd, projectTrusted: trusted, dirs, userRaw: sessionUser, ...(sessionProject && sessionProject.cwd === cwd ? { projectRaw: sessionProject } : {}) });
+  /** Persists one user setting; the running session uses it at once, and no change line follows. */
+  const writeUserSetting = (key: string, value: unknown): string => {
+    const path = writeUserConfig(setNestedValue(readUserConfig(dirs), key, value), dirs);
+    userConfigWritten(new Map([[key, value]]));
+    return path;
+  };
   let panel: PanelController | undefined;
   let configPanel: PanelController | undefined;
   let lastUi: PanelUi | undefined;
@@ -683,7 +732,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
   // Config values that were not applied as written: said once per session; /warden status repeats them.
   let configWarningsReported = false;
   const configFor = (ctx: ExtensionContext | ExtensionCommandContext): WardenConfig => {
-    const { config, missing } = guardCurrentSections(completeConfig(loadConfig({ cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted(), dirs })));
+    const { config, missing } = guardCurrentSections(completeConfig(sessionConfig(ctx.cwd, ctx.isProjectTrusted())));
     if (missing.length && !shapeReported) {
       shapeReported = true;
       // A namespace read stays undefined (not a link error) when an older config module lacks the export.
@@ -827,7 +876,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
   const toggleConfigPanel = (ui: PanelUi | undefined, config: WardenConfig) => {
     if (!ui) return;
     if (configPanel) { configPanel.close(); return; }
-    const opened = openConfigPanel(ui, config, { width: config.widget.panelWidth, dirs });
+    const opened = openConfigPanel(ui, config, { width: config.widget.panelWidth, dirs, userRaw: sessionUser?.value, onWrite: changes => userConfigWritten(changes) });
     configPanel = opened;
     opened.closed.catch(() => undefined).finally(() => { if (configPanel === opened) configPanel = undefined; });
   };
@@ -1219,7 +1268,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
 
   // Record-only: neither calibration met the activation gate, so nothing claims the event or acts on the answers.
   pi.events?.on("pi-subagents/supervision-evaluate/v1", createSupervisionHandler({
-    config: () => guardCurrentSections(completeConfig(loadConfig({ cwd: sessionCwd, projectTrusted: sessionTrusted, dirs }))).config,
+    config: () => guardCurrentSections(completeConfig(sessionConfig(sessionCwd, sessionTrusted))).config,
     judge: config => judgeFor(config, true),
     quietSignal: signal => quietSignals.add(signal),
     record: (line, details) => { trace.push({ at: Date.now(), guard: "subagent", line, details }); },
@@ -1227,6 +1276,11 @@ export default function wardenExtension(host: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     sessionCwd = ctx.cwd;
     sessionTrusted = ctx.isProjectTrusted();
+    // Read both config files once for this session; the snapshot is what every guarded call reuses.
+    sessionProject = { cwd: ctx.cwd, value: readProjectConfig(ctx.cwd, dirs) };
+    sessionUser = { value: readUserConfigFile(dirs) };
+    seenProject = configKey(sessionProject.value);
+    seenUser = configKey(sessionUser.value);
     if (ctx.hasUI) lastUi = ctx.ui as unknown as PanelUi;
     noticeUi = ctx.hasUI ? ctx.ui : undefined;
     // Read the running build once per session: the shipped entry behind Pi's loader, not the source a checkout edits.
@@ -1259,7 +1313,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     initRunning = false;
     lastCalibration = undefined;
     lastCheck = undefined;
-    const startupConfig = loadConfig({ dirs });
+    const startupConfig = sessionUserConfig();
     await initSchema(startupConfig.learning.retentionDays, dirs, startupConfig.learning.allowedRetentionDays);
     stats = freshStats();
     steerWatch.clear();
@@ -1275,7 +1329,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     activeSessionId = sessionId;
     trialArm = "live";
     holdLog = new HoldLog(holdLogPath(sessionId, new Date(), dirs));
-    rulesLog = new RulesLog(ctx.cwd, sessionId, { path: rulesLogPath(ctx.cwd, dirs), onFailure: message => record(ctx, loadConfig({ dirs }), "rules", "rules log write failed", [message]) });
+    rulesLog = new RulesLog(ctx.cwd, sessionId, { path: rulesLogPath(ctx.cwd, dirs), onFailure: message => record(ctx, sessionUserConfig(), "rules", "rules log write failed", [message]) });
     unsubscribeTraceFile?.();
     unsubscribeTraceFile = undefined;
     traceFile = undefined;
@@ -1293,7 +1347,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     const dir = traceDir();
     if (dir) {
       const warn = (text: string) => { if (ctx.hasUI) ctx.ui.notify(text, "warning"); else pi.sendMessage({ customType: `${PACKAGE_NAME}-status`, content: text, display: true }); };
-      const opening = loadConfig({ dirs });
+      const opening = sessionUserConfig();
       traceFile = new TraceFile(traceFilePath(dir, sessionId), dir, { sessionId, cwd: ctx.cwd, mode: opening.mode, judgments: judgmentsState(judgmentsOffReason(opening)) }, warn);
       unsubscribeTraceFile = trace.subscribe(traceFile.listener);
     }
@@ -1347,12 +1401,28 @@ export default function wardenExtension(host: ExtensionAPI): void {
     for (const symptom of Object.keys(slopCounts) as SlopSymptom[]) slopCounts[symptom] = 0;
     if (ctx.hasUI) ctx.ui.setWidget(WIDGET, undefined);
     // One-time notice when confirm mode falls back to steer (headless).
-    if (!warnedFallback && loadConfig({ dirs }).mode === "confirm" && !ctx.hasUI) {
+    if (!warnedFallback && sessionUserConfig().mode === "confirm" && !ctx.hasUI) {
       warnedFallback = true;
       const msg = "warden: confirm mode requires a UI; falling back to steer mode for this session.";
       if (ctx.hasUI) ctx.ui.notify(msg, "warning"); else pi.sendMessage({ customType: `${PACKAGE_NAME}-status`, content: msg, display: true });
     }
     const opening = configFor(ctx);
+    // One line, once per new loosened set: the project file can switch a check off, and this is where the owner hears it.
+    const loosened = loosenedChecks(sessionUserConfig(), opening);
+    // The name and the detail both count: a further loosening of an already-named check is a new set.
+    const recorded = readLoosenRecord(ctx.cwd, dirs);
+    const seen = recorded !== undefined && recorded.length === loosened.length
+      && loosened.every((check, at) => recorded[at]!.name === check.name && recorded[at]!.detail === check.detail);
+    if (loosened.length) {
+      if (!seen) {
+        const line = loosenNotice(loosened, dirs);
+        if (ctx.hasUI) ctx.ui.notify(line, "warning"); else pi.sendMessage({ customType: `${PACKAGE_NAME}-status`, content: line, display: true });
+        writeLoosenRecord(ctx.cwd, loosened, dirs);
+      }
+    } else if (recorded !== undefined && recorded.length) {
+      // An empty set is recorded too, so a set that comes back after going away shows its line again.
+      writeLoosenRecord(ctx.cwd, [], dirs);
+    }
     // ── Silent-half trial ──
     // The arm is fixed for the whole session from its id, so a resume or reload keeps it. With the setting off, no
     // record is written and no delivery changes; only the user's config file can turn it on.
@@ -2027,6 +2097,23 @@ export default function wardenExtension(host: ExtensionAPI): void {
       // Fix 6: armed hits on read-only commands still record a trace line (bypass the read-only source gate).
       if (verdict.source === "read-only") verdict.source = "pattern";
     }
+    // A write to pi-warden's own config can switch a check off, and Pi reports a project trusted when it ships none of
+    // Pi's own resources, so the project file is nearly always applied: the floor holds the write. `action.exemptRules`
+    // naming `warden-config-write` is how the operator silences it, as for any other built-in rule.
+    const configTargets = config.action.exemptRules.includes(CONFIG_HOLD_ID)
+      ? []
+      : configWriteTargets(event.toolName, event.input as Record<string, unknown>, ctx.cwd, dirs, shell);
+    // Name it the way the user sees it: inside this project, otherwise its absolute path.
+    const configNames = configTargets.map(path => {
+      const inside = pathRelative(ctx.cwd, path);
+      return inside && !inside.startsWith("..") ? inside : path;
+    });
+    if (configNames.length) {
+      verdict.patterns.push({ id: CONFIG_HOLD_ID, severity: "destructive", label: `writes pi-warden's own config ${configNames.join(", ")}` });
+      verdict.level = higher(verdict.level, "confirm");
+      verdict.reasons.push(`pi-warden's own config ${configNames.join(", ")}: a write here switches a check off`);
+      if (verdict.source === "read-only") verdict.source = "pattern";
+    }
     const deliveryVerdict = agentDeliveryVerdict(verdict);
     const deliveryReasons = deliveryVerdict.reasons;
     // The agent reads reasons without their scores; the trace, holds, and learning records keep them.
@@ -2214,6 +2301,14 @@ export default function wardenExtension(host: ExtensionAPI): void {
       if (sent) watchSteer(ctx, config, ["warn-headless"]);
       return sent;
     };
+    // Nobody can approve the hold without a UI, so a write to pi-warden's own config is blocked in every mode there.
+    if (configNames.length && verdict.level !== "deny" && !ctx.hasUI) {
+      deliverNotes(false);
+      stats.held++;
+      actionGuard.hold(task);
+      track(true);
+      return { block: true, reason: `pi-warden held this ${event.toolName} call: it writes pi-warden's own config (${configNames.join(", ")}), which can switch a check off. Nothing was written. Do not retry it: ask the user to change that file.` };
+    }
     if (verdict.level === "warn") {
       deliverNotes(true);
       stats.warned++;
@@ -2284,6 +2379,8 @@ export default function wardenExtension(host: ExtensionAPI): void {
 
   pi.on("tool_result", async (event, ctx) => {
     const config = configFor(ctx);
+    // Before any guard's early return: an edit to either config file is named whatever mode the session runs in.
+    reportConfigChanges(ctx);
     if (!config.enabled) return;
     // High-confidence credential values are masked before any other rewrite, so neither the model nor a stored copy
     // sees them. Detection below still reads the original text, so the banner names what was masked. Masking is local
@@ -2808,6 +2905,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
   pi.on("agent_end", async (event, ctx) => {
     if (injectedRun) { injectedRun.release("end"); injectedRun = undefined; }
     const config = configFor(ctx);
+    reportConfigChanges(ctx);
     // The run is over: a notice that no turn of a continuing loop delivered may not be appended now, because a delivery must
     // never start a turn of its own. It is dropped and traced.
     agentRunActive = false;
@@ -2990,7 +3088,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
   });
 
   // Shortcuts are registered once at load; a shape check keeps a typo in the config file from being registered.
-  const shortcut = loadConfig({ dirs }).widget.shortcut;
+  const shortcut = sessionUserConfig().widget.shortcut;
   if (/^(?:(?:ctrl|shift|alt|super)\+)+[a-z0-9]+$|^f\d{1,2}$/i.test(shortcut)) {
     pi.registerShortcut(shortcut as KeyId, {
       description: "Toggle the pi-warden trace sidebar",
@@ -3482,7 +3580,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
           return;
         }
         if (action === "enable") {
-          if (config.backendRefusal !== undefined) { report(`Cannot enable judgments: typesafeBackend refused: ${config.backendRefusal} Fix the value in ${userConfigPath(dirs)}, then run /warden enable again.`, "warning"); return; }
+          if (config.backendRefusal !== undefined) { report(`Cannot enable judgments: typesafeBackend refused: ${config.backendRefusal} Fix the value in ${userConfigPath(dirs)}; a hand edit applies at the next session (/new), then run /warden enable again.`, "warning"); return; }
           const backend = config.typesafeBackend;
           if (!ctx.hasUI) { report(`Consent needs an interactive session. For headless runs set PI_WARDEN_ENABLED=1 and ${resolveBackend(backend).keyEnv} explicitly.`, "warning"); return; }
           // For a non-TypeSafe backend the dialog names who answers: the label, host, and model sent.
@@ -3494,20 +3592,20 @@ export default function wardenExtension(host: ExtensionAPI): void {
           // pi-typesafe consumer; any other backend has no login, so a missing key is reported with the variable to set.
           const key = await ensureApiKey(ctx, backend === undefined ? {} : { backend });
           if (!key) { report("No key entered; pi-warden stays on pattern checks only. Run /warden enable again when you have a key from console.typesafe.ai.", "warning"); return; }
-          const path = setUserSetting("typesafe", true, dirs);
+          const path = writeUserSetting("typesafe", true);
           client = undefined;
           budgetExhausted = false;
           report(`TypeSafe judgments enabled and saved to ${path}${key.login ? `; key verified (${key.login.models} model${key.login.models === 1 ? "" : "s"}) and stored at ${key.login.path}` : ` using the ${key.source === "stored" ? "stored key" : `key from ${resolveBackend(config.typesafeBackend).keyEnv}`}`}. This stays on in new sessions until /warden disable.`);
           return;
         }
         if (action === "disable") {
-          const path = setUserSetting("typesafe", false, dirs);
+          const path = writeUserSetting("typesafe", false);
           report(`TypeSafe judgments disabled in ${path}. Offline pattern checks stay active; set enabled to false there to turn pi-warden off entirely.`);
           return;
         }
         if (action === "mode") {
           if (!isMode(argument)) { report(`Mode is ${activeMode(config, ctx.hasUI)}${process.env.PI_WARDEN_MODE ? " (from PI_WARDEN_MODE)" : ""}. Use /warden mode steer | confirm | advise. steer holds risky calls and tells the agent why; confirm asks you with a dialog; advise only reports.`); return; }
-          const path = setUserSetting("mode", argument, dirs);
+          const path = writeUserSetting("mode", argument);
           report(`Mode set to ${argument} in ${path}.`);
           return;
         }
@@ -3521,22 +3619,21 @@ export default function wardenExtension(host: ExtensionAPI): void {
             const keyPath = rest.slice(0, spaceIndex).trim();
             const rawValue = rest.slice(spaceIndex + 1).trim();
             const value = parseConfigValue(rawValue);
-            const current = readUserConfig(dirs);
-            const updated = setNestedValue(current as Record<string, unknown>, keyPath, value);
-            const savedPath = writeUserConfig(updated, dirs);
+            writeUserSetting(keyPath, value);
             client = undefined;
             report(`Saved ${keyPath} = ${JSON.stringify(value)}.`);
             return;
           }
           if (tail.startsWith("get ")) {
             const keyPath = tail.slice(4).trim();
-            const current = readUserConfig(dirs);
+            // The value the checks use: the session's snapshot, not a file edit that waits for /new.
+            const current = sessionUser?.value !== null && typeof sessionUser?.value === "object" ? sessionUser.value as Record<string, unknown> : {};
             const value = getNestedValue(current as Record<string, unknown>, keyPath);
             const defaultValue = getNestedValue(defaultConfig() as unknown as Record<string, unknown>, keyPath);
             report(value === undefined ? `${keyPath} not set (default: ${JSON.stringify(defaultValue)})` : `${keyPath} = ${JSON.stringify(value)}`);
             return;
           }
-          if (!ctx.hasUI || !lastUi) { report(`Edit ${userConfigPath(dirs)} directly. Use /warden config set <key> <value> for quick changes.`); return; }
+          if (!ctx.hasUI || !lastUi) { report(`Edit ${userConfigPath(dirs)} directly; a hand edit applies at the next session (/new). Use /warden config set <key> <value> to apply one at once.`); return; }
           toggleConfigPanel(lastUi, config);
           return;
         }

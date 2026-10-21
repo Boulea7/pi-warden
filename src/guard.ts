@@ -12,9 +12,11 @@ import type { TaskSpine } from "./shape.js";
 import { askChunks, globToRegExp, questionLimit } from "./rules.js";
 import type { LimitedJudge, RulesSourceConfig } from "./rules.js";
 import { indexDir } from "./index-cmd.js";
+import { PROJECT_CONFIG_FILE, projectConfigPath, userConfigPath } from "./config.js";
 import type { HostDirs } from "./host-dirs.js";
 import { resolveRulesFile } from "./rules-file.js";
 import { mergeWrites, shellWrites } from "./shell-writes.js";
+import type { ShellWriteScan } from "./shell-writes.js";
 import { COMMAND_TOOLS, commandOf } from "./tools.js";
 import { actionAskGate } from "./ask-gate.js";
 import { commandIndex, scriptSources, shellCommands, shellParts, type ScriptSource, type ShellWord as CommandWord } from "./script-bodies.js";
@@ -2098,6 +2100,9 @@ export interface PatternOptions {
   platform?: NodeJS.Platform | undefined;
 }
 
+/** The id an exemption names: `action.exemptRules: ["warden-config-write"]`. */
+export const CONFIG_HOLD_ID = "warden-config-write";
+
 /** Every id exemptRules can legitimately name: the built-in shell rules, the rm-classifier's derived ids, and the
  * sensitive-path id. Unknown ids (a typo, or a rule that never existed) are inert; this list lets the surface be
  * reported once instead of discovered when the rule the user meant to silence keeps firing. */
@@ -2112,6 +2117,7 @@ export const EXEMPTABLE_IDS: readonly string[] = [
   "sql-hosted",
   "sql-hosted-write",
   "sensitive-path",
+  CONFIG_HOLD_ID,
 ];
 
 /** Built-in pattern IDs whose hits become evidence (not level-setters) in evidence mode.
@@ -2298,6 +2304,216 @@ export function writeSinkTargets(command: string): string[] {
     }
   }
   return targets;
+}
+
+/** The resolved form of a path: its real path, or the real path of its deepest existing ancestor plus the rest. */
+function resolvedTarget(path: string): string {
+  return realTarget(path) ?? resolve(path);
+}
+
+interface ConfigRoots { files: Set<string>; dirs: string[]; free: string[] }
+
+/**
+ * The form two paths are compared in. APFS is case-insensitive and realpath keeps the typed case, so `.pi/PI-WARDEN.JSON`
+ * and `.pi/pi-warden.json` are one file on this disk (measured on APFS, 21 Oct 2026); folding on every platform makes a
+ * hold of the other case on a case-sensitive disk the only cost.
+ */
+export function foldPath(path: string): string {
+  return path.normalize("NFC").toLowerCase();
+}
+
+const underRoot = (target: string, root: string): boolean => {
+  const file = foldPath(target);
+  const dir = foldPath(root);
+  return file === dir || file.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+};
+
+/** pi-warden's own config as the OS resolves it: the project file, and the user's pi-warden directory. */
+function configRoots(cwd: string | undefined, dirs: HostDirs): ConfigRoots {
+  const files = new Set<string>();
+  if (cwd) files.add(foldPath(resolvedTarget(projectConfigPath(cwd, dirs))));
+  // `/warden index` asks the session model to write the capability index, so that one folder inside the user directory
+  // stays free: it holds recommendations, never a check.
+  return { files, dirs: [resolvedTarget(dirname(userConfigPath(dirs)))], free: [resolvedTarget(indexDir(process.env, dirs))] };
+}
+
+/** A resolved path that is pi-warden's own config: the project file, any `pi-warden.json` in a `.pi` directory, or a
+ *  file in the user's pi-warden directory. */
+function isConfigTarget(target: string, roots: ConfigRoots, configDirName: string): boolean {
+  if (roots.files.has(foldPath(target))) return true;
+  if (foldPath(basename(target)) === foldPath(PROJECT_CONFIG_FILE)) {
+    const parent = foldPath(basename(dirname(target)));
+    // A vendored or copied project file is the same file to whoever edits it, whatever project it sits in.
+    if (parent === foldPath(configDirName) || parent === ".pi") {
+      // Tests and drives build scratch projects under the temp directory, at any depth: a project there keeps its file
+      // free, because a drive writes one as a fixture. The session's own file is `roots.files` above, checked first.
+      return !tempRoots().some(root => underRoot(target, root));
+    }
+  }
+  if (roots.free.some(root => underRoot(target, root))) return false;
+  return roots.dirs.some(root => underRoot(target, root));
+}
+
+/** A written path resolved as the shell and the OS read it: `~`, `$HOME`, a relative path, `..`, and a symlink. */
+function configCandidate(text: string, cwd: string): string | undefined {
+  const home = homedir();
+  let word = text.trim();
+  if (!word) return undefined;
+  for (const prefix of ["${HOME}", "$HOME"]) {
+    if (word === prefix || word.startsWith(`${prefix}/`)) { word = `${home}${word.slice(prefix.length)}`; break; }
+  }
+  if (word === "~") word = home;
+  else if (word.startsWith("~/")) word = join(home, word.slice(2));
+  // A variable this reader cannot expand could name anything; the session snapshot covers what this misses.
+  if (word.includes("$")) return undefined;
+  return resolvedTarget(isAbsolute(word) ? word : resolve(cwd, word));
+}
+
+const COPY_HEADS = new Set(["cp", "mv", "ln", "install", "rsync"]);
+const IN_PLACE_HEADS = new Set(["sed", "gsed", "perl"]);
+/** Redirect operators that read or duplicate a descriptor; every other one writes a file. */
+const NON_WRITE_REDIRECTS = new Set(["<", "<<", "<<-", "<<<", "<&"]);
+const RECURSIVE = /^-[A-Za-z]*[rRa]/;
+
+/** What a command writes: resolved paths, and the file names held after a `cd` the reader cannot resolve. */
+interface CommandWrites { targets: string[]; named: string[] }
+
+/**
+ * Every path a shell command writes, from the shapes the floor already reads (redirects, `tee`, heredocs, the script it
+ * runs) plus the destination of `cp`/`mv`/`ln`/`install`/`rsync`, the file an in-place editor rewrites, an output file
+ * of `curl`/`wget`, and a source that `rm`, `unlink`, `mv` or `ln` takes away. The command is read by `shellCommands`,
+ * the reader the delete classifier uses: it follows a literal `cd`, reads a `-c` string and a wrapper, and names the
+ * directory each write runs in. What a program writes (`node -e`, a script fed to an interpreter) is not in the command
+ * text and is not read here; neither is a destination named by a variable.
+ */
+function commandWriteTargets(command: string, cwd: string | undefined, depth: number, scan?: ShellWriteScan): CommandWrites {
+  const targets: string[] = [];
+  const named: string[] = [];
+  const writes = scan ?? shellWrites(command, { home: homedir() });
+  // A skipped write still names its target (`sed -i`, a pipe into tee), and the walk below reads that path with the
+  // directory the command runs in; the skip's own path is left out because it was resolved before a `cd` was followed.
+  for (const write of writes.writes) targets.push(write.path);
+  const code = stripShellComments(command);
+  // The shell reader cannot expand `$HOME`, and it names the same directory the shell does, so expand it first. The
+  // structured reader below takes the text as typed: blanking quoted data would blank a quoted redirect target too.
+  const text = code.replace(/\$\{HOME\}|\$HOME(?![A-Za-z0-9_])/g, homedir());
+  // Redirect and tee targets as written, for the name a `cd` the reader cannot resolve leaves behind.
+  const sinkNames = writeSinkTargets(stripDataText(code).text);
+  const baseOf = (dir: string): string | undefined => (isAbsolute(dir) ? dir : cwd === undefined ? undefined : resolve(cwd, dir));
+  const push = (word: string | undefined, dir: string | undefined): void => {
+    if (!word || !dir) return;
+    targets.push(isAbsolute(word) ? word : join(dir, word));
+  };
+  /** Whether a destination names a directory: a trailing slash, a `-t` value, or one that exists as a directory. */
+  const isDirectory = (word: string, dir: string | undefined): boolean => {
+    if (word.endsWith("/") || word === "." || word === "..") return true;
+    try { return dir !== undefined && statSync(isAbsolute(word) ? word : join(dir, word)).isDirectory(); } catch { return false; }
+  };
+  let unresolved = false;
+  for (const call of shellCommands(text)) {
+    const dir = baseOf(call.dir);
+    const at = commandIndex(call.words);
+    const head = at === undefined ? "" : basename(call.words[at]!.text);
+    const words = at === undefined ? [] : call.words.slice(at + 1).map(word => word.text);
+    for (const redirect of call.redirects) {
+      if (NON_WRITE_REDIRECTS.has(redirect.op)) continue;
+      // `>&2` and `2>&1` duplicate a descriptor and name no file.
+      if (redirect.op === ">&" && /^(?:\d+|-)$/.test(redirect.target.text)) continue;
+      push(redirect.target.text, dir);
+    }
+    if (head === "cd" || head === "pushd") {
+      const operand = call.words.slice((at ?? 0) + 1).find(word => word.text === "-" || !word.text.startsWith("-"));
+      if (operand && (!operand.literal || operand.text === "-")) unresolved = true;
+      continue;
+    }
+    const operands = words.filter(word => !word.startsWith("-"));
+    const value = (flag: string): string | undefined => {
+      for (let index = 0; index < words.length; index++) {
+        const word = words[index]!;
+        if (word === flag) return words[index + 1];
+        const inline = flag.startsWith("--") && word.startsWith(`${flag}=`) ? word.slice(flag.length + 1) : undefined;
+        if (inline) return inline;
+      }
+      return undefined;
+    };
+    if (head === "tee") { for (const word of operands) push(word, dir); continue; }
+    if (head === "curl" || head === "wget") {
+      const flag = head === "curl" ? (words.includes("-o") ? "-o" : "--output") : (words.includes("-O") ? "-O" : "--output-document");
+      const output = value(flag);
+      if (output) push(output, dir);
+      continue;
+    }
+    if (COPY_HEADS.has(head)) {
+      const namedDirectory = words.find(word => word === "-t" || word === "--target-directory");
+      const targetDirectory = namedDirectory ? words[words.indexOf(namedDirectory) + 1] : value("--target-directory");
+      const destination = targetDirectory ?? (operands.length >= 2 ? operands.at(-1) : undefined);
+      if (destination) push(destination, dir);
+      // `ln -t dir a`, `mv -t dir a`: every operand is a source.
+      const sources = targetDirectory ? operands : operands.slice(0, -1);
+      // A source that is pi-warden's config is taken out of the project by `mv`, and a link to it reaches it by `ln`.
+      if (head === "mv" || head === "ln") for (const source of (head === "ln" && !targetDirectory ? operands.slice(0, 1) : sources)) push(source, dir);
+      if (destination && (words.some(word => RECURSIVE.test(word) || word === "--recursive" || word === "--archive") || isDirectory(destination, dir))) {
+        // A copy into a directory lands each source under its own name, and a copied `.pi` lands its project file.
+        for (const source of sources) {
+          const bare = source.replace(/\/+$/, "");
+          push(join(destination, basename(bare)), dir);
+          if (foldPath(basename(bare)) === ".pi") push(join(destination, ...(source.endsWith("/") ? [] : [".pi"]), PROJECT_CONFIG_FILE), dir);
+        }
+      }
+      continue;
+    }
+    if (IN_PLACE_HEADS.has(head)) {
+      if (words.some(word => /^-[A-Za-z]*i/.test(word) || word.startsWith("--in-place"))) for (const operand of operands) push(unquoteWord(operand), dir);
+      continue;
+    }
+    if (head === "rm" || head === "unlink") { for (const operand of operands) push(unquoteWord(operand), dir); continue; }
+    if (head === "dd") { for (const word of words) if (word.startsWith("of=")) push(unquoteWord(word.slice(3)), dir); continue; }
+    if (head === "truncate" || head === "touch") for (const operand of operands) push(unquoteWord(operand), dir);
+  }
+  // A script the command runs writes through the same shapes; its body is read once, one level deep.
+  if (cwd && depth > 0) {
+    for (const source of scriptSources(code, cwd)) {
+      if (source.kind !== "shell") continue;
+      const inner = commandWriteTargets(source.body, cwd, depth - 1);
+      targets.push(...inner.targets);
+      named.push(...inner.named);
+    }
+  }
+  // A `cd` the reader cannot resolve leaves the directory unknown: the file name is the only fact left.
+  if (unresolved) for (const target of [...targets, ...sinkNames]) if (!isAbsolute(target) && foldPath(basename(target)) === foldPath(PROJECT_CONFIG_FILE)) named.push(target);
+  return { targets, named };
+}
+
+/**
+ * The paths a call writes that are pi-warden's own config, in the order the call writes them. A read is not a write:
+ * `cat .pi/pi-warden.json` and `cp .pi/pi-warden.json /tmp` stay free. `scan` is the shell reader the caller already ran
+ * for this command, so a command is not parsed twice.
+ */
+export function configWriteTargets(
+  tool: string,
+  input: Record<string, unknown>,
+  cwd: string,
+  dirs: HostDirs,
+  scan?: ShellWriteScan,
+): string[] {
+  const view = commandOf(tool, input);
+  // Only a file tool that writes has a path side; `read` on the same path is the agent reading its own config.
+  const path = isWriteTool(tool) && typeof input.path === "string" ? input.path : undefined;
+  const writes: CommandWrites = view?.command ? commandWriteTargets(view.command, cwd, 1, scan) : { targets: path ? [path] : [], named: [] };
+  if (!writes.targets.length && !writes.named.length) return [];
+  const roots = configRoots(cwd, dirs);
+  const held: string[] = [];
+  for (const candidate of writes.targets) {
+    const target = configCandidate(candidate, cwd);
+    if (!target || held.includes(target) || !isConfigTarget(target, roots, dirs.configDirName)) continue;
+    held.push(target);
+  }
+  // The cd hid the directory; the name still names pi-warden's config, so the call is held and shown by its name.
+  for (const candidate of writes.named) {
+    const target = join(cwd, candidate);
+    if (!held.includes(target)) held.push(target);
+  }
+  return held;
 }
 
 /** Shared glob/regex path matcher used by both path rules (guard.ts) and arming rules (arming.ts).

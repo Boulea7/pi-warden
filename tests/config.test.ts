@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { ArmingTracker } from "../src/arming.js";
-import { applyProjectOverrides, applyUserOverrides, defaultConfig, loadConfig, setUserSetting, userConfigPath } from "../src/config.js";
+import { applyProjectOverrides, applyUserOverrides, defaultConfig, loadConfig, loosenNotice, loosenRecordPath, loosenedChecks, readLoosenRecord, readProjectConfig, setUserSetting, userConfigPath, writeLoosenRecord } from "../src/config.js";
 import { completeConfig } from "../src/shape.js";
 
 let temporary: string;
@@ -586,4 +586,162 @@ test("removed keys: conscience.loadThreshold and learning.adaptiveThresholds eac
   assert.equal(both.warnings.length, 2, "two keys, two warnings");
   assert.deepEqual(applyUserOverrides(defaultConfig(), { conscience: { recommendThreshold: 0.9 }, learning: { patternAnalysis: false } }).warnings, [], "a config without them gives none");
   assert.deepEqual(applyProjectOverrides(defaultConfig(), { conscience: { enabled: true }, learning: {} }).warnings, []);
+});
+
+// --- the project file: read once per session, and what it loosens is named once ---
+
+test("a session reads its project file once: a later edit waits for the next session, the user file stays live", async () => {
+  const file = join(project, ".pi", "pi-warden.json");
+  const user = userConfigPath();
+  await mkdir(join(temporary, "agent", "pi-warden"), { recursive: true });
+  await writeFile(user, JSON.stringify({ slop: { enabled: false } }));
+  await writeFile(file, JSON.stringify({ done: { enabled: false } }));
+  const snapshot = { value: readProjectConfig(project) };
+  const opening = loadConfig({ cwd: project, projectTrusted: true, projectRaw: snapshot });
+  assert.equal(opening.done.enabled, false);
+  assert.equal(opening.slop.enabled, false);
+  // A mid-session edit of either file: the project file holds, the user file is read again on every call.
+  await writeFile(file, JSON.stringify({ done: { enabled: true } }));
+  await writeFile(user, JSON.stringify({ slop: { enabled: true } }));
+  const sameSession = loadConfig({ cwd: project, projectTrusted: true, projectRaw: snapshot });
+  assert.equal(sameSession.done.enabled, false, "the snapshot decides for this session");
+  assert.equal(sameSession.slop.enabled, true, "the user file keeps its live reading");
+  const nextSession = loadConfig({ cwd: project, projectTrusted: true, projectRaw: { value: readProjectConfig(project) } });
+  assert.equal(nextSession.done.enabled, true, "the next session reads the project file again");
+  await rm(file, { force: true });
+  await rm(user, { force: true });
+});
+
+test("loosenedChecks names every check a project file takes away, and nothing when it takes none", () => {
+  const user = defaultConfig();
+  const layered = (raw: unknown) => applyProjectOverrides(user, raw);
+  assert.deepEqual(loosenedChecks(user, layered({})), [], "an empty project file loosens nothing");
+  assert.deepEqual(loosenedChecks(user, layered({ done: { enabled: true } })), [], "a stricter value loosens nothing");
+  const switched = loosenedChecks(user, layered({ done: { enabled: false }, cause: { enabled: false }, rules: { enabled: false } }));
+  assert.deepEqual(switched, [{ name: "done-check" }, { name: "cause-check" }, { name: "rules-check" }]);
+  assert.equal(loosenNotice(switched), "This project's .pi/pi-warden.json switches off: done-check, cause-check, rules-check.");
+  const raised = loosenedChecks(user, layered({ done: { claimsDone: 0.95 }, rules: { threshold: 0.9 } }));
+  assert.deepEqual(raised, [
+    { name: "done-check", detail: "claims-done threshold 0.7 → 0.95" },
+    { name: "rules-check", detail: "threshold 0.7 → 0.9" },
+  ]);
+  assert.match(loosenNotice(raised), /^This project's \.pi\/pi-warden\.json loosens: done-check \(claims-done threshold 0\.7 → 0\.95\), rules-check \(threshold 0\.7 → 0\.9\)\.$/);
+  // A project file cannot weaken the action guard or security: the loader refuses those values, so nothing is loosened.
+  assert.deepEqual(loosenedChecks(user, layered({ action: { irreversible: { confirm: 0.99 } }, security: { enabled: false } })), []);
+  const narrowed = loosenedChecks(user, layered({ rules: { files: ["RULES.md"], exclude: ["vendor/**"] }, done: { uiFiles: ["**/*.tsx"] } }));
+  assert.deepEqual(narrowed, [
+    { name: "done-check", detail: `UI files left out: ${user.done.uiFiles.join(", ")}` },
+    { name: "rules-check", detail: "excluded paths added: vendor/**" },
+  ]);
+});
+
+test("the loosened set is recorded per project: a missing or unreadable record shows the line", async () => {
+  const other = join(temporary, "other-project");
+  await mkdir(other, { recursive: true });
+  assert.equal(readLoosenRecord(project), undefined, "no record yet");
+  writeLoosenRecord(project, [{ name: "done-check" }]);
+  assert.deepEqual(readLoosenRecord(project), [{ name: "done-check" }]);
+  writeLoosenRecord(project, [{ name: "cause-check", detail: "claims-cause threshold 0.7 → 0.95" }]);
+  assert.deepEqual(readLoosenRecord(project), [{ name: "cause-check", detail: "claims-cause threshold 0.7 → 0.95" }], "the detail is kept, so a further loosening of a named check shows again");
+  assert.equal(readLoosenRecord(other), undefined, "another project has its own record");
+  await writeFile(loosenRecordPath(project), "{ not json");
+  assert.equal(readLoosenRecord(project), undefined, "an unreadable record shows the line again");
+  // A record written before details were kept is not the same set: the line shows once more after the upgrade.
+  await writeFile(loosenRecordPath(project), JSON.stringify({ version: 1, loosened: ["cause-check"] }));
+  assert.equal(readLoosenRecord(project), undefined, "a names-only record reads as differs");
+  await rm(loosenRecordPath(project), { force: true });
+  await rm(other, { recursive: true, force: true });
+});
+
+test("the notice names every real loosening: switches, thresholds, lists and visual tools", () => {
+  const user = defaultConfig();
+  const of = (raw: unknown) => loosenedChecks(user, applyProjectOverrides(user, raw));
+  const named = (raw: unknown) => of(raw).map(check => check.name);
+  for (const [raw, name] of [
+    [{ slop: { prose: { enabled: false } } }, "slop-check"],
+    [{ rules: { fallback: false } }, "rules-check"],
+    [{ rules: { maxChars: 500 } }, "rules-check"],
+    [{ stuck: { minFailures: 9 } }, "stuck-check"],
+    [{ waste: { enabled: false } }, "waste note"],
+    [{ context: { largeOutput: { enabled: false } } }, "large-output notice"],
+    [{ cause: { windowDays: 1 } }, "cause-check"],
+    [{ done: { claimsDone: 0.95 } }, "done-check"],
+    [{ done: { uiProof: false } }, "done-check"],
+  ] as const) assert.ok(named(raw).includes(name), JSON.stringify(raw));
+  // A project file can switch notifications off only from an on user value.
+  const notifyOn = applyUserOverrides(user, { notify: { enabled: true } });
+  assert.ok(loosenedChecks(notifyOn, applyProjectOverrides(notifyOn, { notify: { enabled: false } })).some(check => check.name === "notify"), "notify");
+  // A project list replaces the user's: an added visual tool loosens, a removed one tightens.
+  const added = of({ done: { visualTools: { commands: [...user.done.visualTools.commands, "screenshot.sh"] } } });
+  assert.equal(added.length, 1);
+  assert.match(added[0]!.detail ?? "", /screenshot\.sh/);
+  assert.deepEqual(of({ done: { visualTools: { tools: [] } } }), [], "no visual tool is stricter");
+  // A stricter value loosens nothing.
+  assert.deepEqual(of({ rules: { threshold: 0.5 }, stuck: { minFailures: 1 }, cause: { windowDays: 90 } }), []);
+});
+
+test("every key a project file can set is classified as loosening a check or not a check", async () => {
+  const table = (await import("../src/config.js") as unknown as { PROJECT_KEYS?: Record<string, { kind: string; why?: string; check?: string }> }).PROJECT_KEYS;
+  assert.ok(table, "the classification table is exported");
+  const leaves: string[] = [];
+  const walk = (value: unknown, path: string): void => {
+    if (Array.isArray(value) || value === null || typeof value !== "object" || Object.keys(value).length === 0) { leaves.push(path); return; }
+    for (const [key, inner] of Object.entries(value)) walk(inner, path ? `${path}.${key}` : key);
+  };
+  walk(defaultConfig(), "");
+  // The top-level keys applyProjectOverrides can replace, or set for a project.
+  const projectSections = new Set(["enabled", "action", "stuck", "done", "cause", "slop", "security", "rules", "rulesAtTurnStart", "context", "runaway", "notify", "judge", "subagent", "waste", "compaction", "prefs"]);
+  const unclassified = leaves.filter(path => projectSections.has(path.split(".")[0]!) && table![path] === undefined);
+  assert.deepEqual(unclassified, []);
+  const stale = Object.keys(table!).filter(path => !leaves.includes(path));
+  assert.deepEqual(stale, [], "a table row for a key that no longer exists");
+  for (const [path, entry] of Object.entries(table!)) {
+    assert.ok(entry.kind === "none" ? Boolean(entry.why && entry.why.length) : Boolean(entry.check), `${path} says why it is not a check, or which check it loosens`);
+  }
+});
+
+test("a session reads its user file once too: an outside edit waits for the next session", async () => {
+  const user = userConfigPath();
+  await writeFile(user, JSON.stringify({ mode: "steer", slop: { enabled: false } }));
+  // The snapshot the extension takes at session start: the file's content, read once.
+  const snapshot = { value: JSON.parse(await readFile(user, "utf8")) as Record<string, unknown> };
+  const opening = loadConfig({ userRaw: snapshot });
+  assert.equal(opening.mode, "steer");
+  assert.equal(opening.slop.enabled, false);
+  await writeFile(user, JSON.stringify({ mode: "advise", slop: { enabled: true } }));
+  const sameSession = loadConfig({ userRaw: snapshot });
+  assert.equal(sameSession.mode, "steer", "the snapshot decides for this session");
+  assert.equal(sameSession.slop.enabled, false, "an outside edit of any key waits");
+  assert.equal(loadConfig().mode, "advise", "a library caller without a snapshot reads the file as before");
+  await rm(user, { force: true });
+});
+
+test("each direction that loosens is named, both ways: window days, trace-only mode, judge cooldown", () => {
+  const user = defaultConfig();
+  const of = (base: typeof user, raw: unknown) => loosenedChecks(base, applyProjectOverrides(base, raw));
+  // A shorter cause window forgets earlier causes, so the repeat question is asked less: it loosens. A longer one tightens.
+  assert.deepEqual(of(user, { cause: { windowDays: 1 } }).map(check => check.name), ["cause-check"]);
+  assert.deepEqual(of(user, { cause: { windowDays: 90 } }), []);
+  assert.match(of(user, { cause: { windowDays: 1 } })[0]!.detail ?? "", /window days 7 → 1/);
+  // "all" keeps every mismatch in the trace only and "none" always steers, so moving toward "all" loosens.
+  const traceOnly = applyUserOverrides(user, { action: { intentTraceOnly: "all" } });
+  assert.deepEqual(of(traceOnly, { action: { intentTraceOnly: "none" } }), [], "steering every mismatch is stricter");
+  const steers = applyUserOverrides(user, { action: { intentTraceOnly: "none" } });
+  assert.match(of(steers, { action: { intentTraceOnly: "all" } })[0]?.detail ?? "", /trace-only mode none → all/);
+  // Fewer failures cool the judge down sooner, so a lower value loosens.
+  assert.deepEqual(of(user, { judge: { failuresBeforeCooldown: 1 } }).map(check => check.name), ["judge"]);
+  assert.match(of(user, { judge: { failuresBeforeCooldown: 1 } })[0]!.detail ?? "", /failures before cooldown 3 → 1/);
+  assert.deepEqual(of(user, { judge: { failuresBeforeCooldown: 9 } }), []);
+});
+
+test("an empty loosened set is a record of its own, so the same set coming back reads as different", () => {
+  writeLoosenRecord(project, [{ name: "cause-check", detail: "window days 7 → 1" }]);
+  writeLoosenRecord(project, []);
+  assert.deepEqual(readLoosenRecord(project), [], "the empty set is recorded, not missing");
+  assert.notEqual(readLoosenRecord(project), undefined, "a missing record and an empty one are different");
+  // A set that comes back after the empty record is not the recorded set, so its line shows again.
+  const recorded = readLoosenRecord(project)!;
+  assert.notEqual(recorded.length, 1);
+  writeLoosenRecord(project, []);
+  assert.deepEqual(readLoosenRecord(project), []);
 });

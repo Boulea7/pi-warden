@@ -246,8 +246,9 @@ export class ConfigPanel implements Component {
   private readonly edits = new Map<string, unknown>();
   private readonly entries: ConfigEntry[];
 
-  constructor(private readonly config: WardenConfig, private readonly theme: ThemeLike, private readonly actions: PanelActions, private readonly requestRender: () => void, private readonly dirs: HostDirs = defaultHostDirs()) {
-    const raw = readUserConfig(dirs);
+  constructor(private readonly config: WardenConfig, private readonly theme: ThemeLike, private readonly actions: PanelActions, private readonly requestRender: () => void, private readonly dirs: HostDirs = defaultHostDirs(), userRaw?: unknown, private readonly onWrite?: (changes: ReadonlyMap<string, unknown>) => void) {
+    // The session's snapshot when it has one: the panel shows what the checks use, not a file edit that waits for /new.
+    const raw = userRaw !== null && typeof userRaw === "object" ? userRaw as Record<string, unknown> : readUserConfig(dirs);
     const user = applyUserOverrides(defaultConfig(), raw);
     let visible: Record<string, unknown> = { ...config, context: { recallTool: user.context.recallTool } };
     // Only selector rows use the user layer; never persist a trusted project's recall override here.
@@ -459,6 +460,7 @@ export class ConfigPanel implements Component {
         current[keys.at(-1)!] = value;
       }
       writeUserConfig(obj, this.dirs);
+      this.onWrite?.(changes);
       this.notice = "";
       return true;
     } catch (error) {
@@ -469,12 +471,12 @@ export class ConfigPanel implements Component {
   }
 }
 
-export function openConfigPanel(ui: PanelUi, config: WardenConfig, options: { width?: string | number; dirs?: HostDirs } = {}): PanelController {
+export function openConfigPanel(ui: PanelUi, config: WardenConfig, options: { width?: string | number; dirs?: HostDirs; userRaw?: unknown; onWrite?: (changes: ReadonlyMap<string, unknown>) => void } = {}): PanelController {
   let close: () => void = () => {};
   let unfocus: () => void = () => {};
   const closed = ui.custom<void>((tui, theme, _keybindings, done) => {
     close = () => done();
-    const panel = new ConfigPanel(config, theme, { close, unfocus: () => unfocus() }, () => tui.requestRender(), options.dirs);
+    const panel = new ConfigPanel(config, theme, { close, unfocus: () => unfocus() }, () => tui.requestRender(), options.dirs, options.userRaw, options.onWrite);
     const rows = tui.terminal?.rows;
     if (typeof rows === "number") panel.setViewport(rows - 2);
     return panel;

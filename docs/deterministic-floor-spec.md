@@ -376,6 +376,55 @@ New config key `action.armingRules` (user file only):
 
 ---
 
+## The config hold: `warden-config-write`
+
+The fourth built-in rule, and the first one that holds a path rather than a command. Pi 1.3.0
+reports a project trusted, without reading a trust record, when the project ships none of Pi's
+own resources (`dist/core/project-trust.js:22`, the list at `dist/core/trust-manager.js:8-17`),
+so `loadConfig` applies `.pi/pi-warden.json` in nearly every project, and a measured drive showed
+that `{"done":{"enabled":false}}` there removes the done-check — also when the file is written
+mid-session, because the config was re-read on every call. An agent that can write that file can
+switch off the checks it is being judged by. The rule holds the write; the session snapshot of both
+config files (`docs/configuration.md`) makes any shape the rule misses harmless for the current run.
+
+- **What it holds.** A `write` or `edit` of `.pi/pi-warden.json`, of any `pi-warden.json` inside
+  a `.pi` directory, or of a file in `<agent dir>/pi-warden/` other than `<agent dir>/pi-warden/index/`
+  (the capability index, which `/warden index` asks the session model to write). A `bash` call that
+  writes one, read by `shellCommands` (`src/script-bodies.ts`) — the reader the delete classifier
+  uses — so a redirect, `tee`, a heredoc, `echo`/`printf`, a `-c` string of `sh`/`bash`/`zsh`/`dash`,
+  a wrapper, and a literal `cd`/`pushd` are all read, plus the destination of
+  `cp`/`mv`/`ln`/`install`/`rsync`, the file of `sed -i`/`perl -i`, `dd of=`, `truncate`, `touch`,
+  the output file of `curl -o`/`wget -O`, the source of `rm`/`unlink`/`mv`/`ln`, and the body of a
+  script the command runs, one level deep. Two shell facts the first version missed: a `cd sub`
+  moves the relative writes after it (so a held path is named under `sub`, not the call's
+  directory), and a directory destination writes each source under its own name (so
+  `cp /tmp/pi-warden.json .pi/` and a recursive copy of a `.pi` are held).
+- **Path resolution.** `~`, `$HOME`, relative paths against the directory the write runs in, `..`,
+  and symlinks, both sides through `realTarget`, so another spelling of the same file is the same
+  file. Every path and file name compare is made case-folded and in one Unicode form by `foldPath`
+  (`src/guard.ts`), because APFS treats `.pi/PI-WARDEN.JSON` and `.pi/pi-warden.json` as one file
+  and realpath keeps the typed case (measured 21 Oct 2026). After a `cd` the reader cannot resolve
+  (a variable, `cd -`), a relative write whose file name is `pi-warden.json` is held by that name.
+- **Scratch projects.** A `pi-warden.json` in a `.pi` directory at any depth under a temp root stays
+  free: tests and drives build scratch projects there, and a drive may nest one. A session started
+  in such a project has its own file in `roots.files`, checked first and folded the same way, so
+  that file is held and the session gets the notice line.
+- **The read side stays free.** `read`, `cat`, `grep`, and `cp`/`mv` *from* the config are not
+  writes. So are `pi-warden.md` (the project rules file, which `/warden improve` asks the model to
+  edit) and every other file under `.pi/`. A `mv` *of* the config is not a read: it removes a check
+  that may be stricter than the user's, so it is held.
+- **Why it is not `deny`.** A `deny` hit blocks with no dialog, and the owner editing their own
+  config through the agent is legitimate. The hit is `destructive`, so the existing ladder decides:
+  a dialog in `confirm` mode, a steer hold in `steer` mode, a warning in `advise` mode, and with no
+  UI a block in every mode.
+- **Exemption.** `action.exemptRules: ["warden-config-write"]`, the same hatch every built-in id has.
+- **What it does not read.** A program's own write (`node -e`, a heredoc fed to an interpreter),
+  `git apply` and `patch`, an editor, a destination named by a variable, and a write to another file
+  name after a `cd` it cannot resolve. Both config files stay under the session snapshot, which is
+  the backstop this rule is designed with rather than an afterthought: a shape the hold misses
+  changes nothing in the running session, and one line says the file changed and applies at the
+  next session.
+
 ## Threat model
 
 Two new surfaces deserve explicit attention:
