@@ -8,6 +8,29 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 <!-- Empty. Next release starts here. -->
 
+## 1.14.0
+
+### Added
+
+- **The agent's writes to pi-warden's own config are held.** A `write`, `edit`, or `bash` call that writes `.pi/pi-warden.json`, or a file in `<agent dir>/pi-warden/`, is held by a new built-in floor rule, `warden-config-write`, so a cloned repository cannot switch a check off by having the agent edit its own config. The command reader finds the write in a redirect, `tee`, a heredoc, a `-c` string, a wrapper, or a script the command runs; in the destination of `cp`, `mv`, `ln`, `install`, `rsync`, `truncate`, `touch`, `dd of=`, `sed -i`, `perl -i`, `curl -o`, or `wget -O`; and in the source of `rm`, `unlink`, `mv`, or `ln`. It follows a literal `cd` or `pushd` and resolves `~`, `$HOME`, `..`, a relative path, and symlinks. The capability index stays writable, reads stay free, and `action.exemptRules: ["warden-config-write"]` (user file only) silences the rule like any built-in.
+- **One line at session start names every check the project file loosens**, and from which file. The record of the last loosened set is kept per project beside the user config; a further loosening of an already-named check shows the line again, and the same set stays quiet.
+- **One line when either config file changes during a session** without pi-warden's own write. It names `.pi/pi-warden.json` or `your pi-warden config`, never a full path, shows once per new content, and says the change applies at the next session.
+
+### Changed
+
+- Both config files are read once at session start, and those snapshots serve every call of the session; a mid-session edit applies from the next session, so a write shape the floor misses cannot change a check mid-run. `/warden enable`, `/warden disable`, `/warden mode`, `/warden config set`, and the config panel update the snapshot in the same step, so they still apply at once.
+- The loosening direction is named correctly for `cause.windowDays` (lowered), `action.intentTraceOnly` (moved to a quieter mode), and `judge.failuresBeforeCooldown`.
+
+### Fixed
+
+- A scratch project's `pi-warden.json` stays free at any depth under a temp root; the session's own project file is never exempt.
+- An empty loosened set is recorded as a set of its own, so a set that goes away and comes back shows its line again.
+- Every config path and file name is compared case-folded and in one Unicode form, because APFS treats `.pi/PI-WARDEN.JSON` and `.pi/pi-warden.json` as one file.
+
+### Docs
+
+- `configuration.md`: when the config files are read, and the loosening notice with its per-project record. `guards.md`: the `warden-config-write` hold. `deterministic-floor-spec.md`: the config hold and its write shapes.
+
 ## 1.13.0
 
 ### Added
