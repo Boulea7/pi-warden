@@ -1363,13 +1363,14 @@ export default function wardenExtension(host: ExtensionAPI): void {
     // One line, once per new loosened set: the project file can switch a check off, and this is where the owner hears it.
     const loosened = loosenedChecks(loadConfig({ dirs }), opening);
     if (loosened.length) {
-      const names = loosened.map(check => check.name);
+      // The name and the detail both count: a further loosening of an already-named check is a new set.
       const recorded = readLoosenRecord(ctx.cwd, dirs);
-      const seen = recorded !== undefined && recorded.length === names.length && names.every(name => recorded.includes(name));
+      const seen = recorded !== undefined && recorded.length === loosened.length
+        && loosened.every((check, at) => recorded[at]!.name === check.name && recorded[at]!.detail === check.detail);
       if (!seen) {
         const line = loosenNotice(loosened, dirs);
         if (ctx.hasUI) ctx.ui.notify(line, "warning"); else pi.sendMessage({ customType: `${PACKAGE_NAME}-status`, content: line, display: true });
-        writeLoosenRecord(ctx.cwd, names, dirs);
+        writeLoosenRecord(ctx.cwd, loosened, dirs);
       }
     }
     // ── Silent-half trial ──

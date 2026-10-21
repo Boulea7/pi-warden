@@ -2017,7 +2017,6 @@ test("reading pi-warden's config, and writing next to it, stays free", async () 
     "grep -n done .pi/pi-warden.json",
     "head -3 .pi/pi-warden.json",
     "cp .pi/pi-warden.json /tmp/warden-copy.json",
-    "mv .pi/pi-warden.json /tmp/warden-copy.json",
     "sed -n '1,2p' .pi/pi-warden.json",
     `cat ${join(userDir, "config.json")}`,
   ]) {
@@ -2036,4 +2035,103 @@ test("the config hold is a built-in rule an exemption can name", () => {
   assert.ok(EXEMPTABLE_IDS.includes(CONFIG_HOLD_ID));
   assert.ok(BUILT_IN_IDS.has(CONFIG_HOLD_ID));
   assert.deepEqual(unknownExemptIds([CONFIG_HOLD_ID]), []);
+});
+
+// --- the config hold against the shapes an independent check used to switch checks off ---------------------------
+
+const real = (path: string) => realTarget(path) ?? path;
+const userDir = () => join(process.env.PI_CODING_AGENT_DIR!, PACKAGE_NAME);
+
+test("a write to pi-warden's config through a shell string, a cd, curl or wget is held", async () => {
+  await mkdir(join(cwd, ".pi"), { recursive: true });
+  await mkdir(join(cwd, "sub", ".pi"), { recursive: true });
+  await mkdir(join(userDir(), "holds"), { recursive: true });
+  const project = real(join(cwd, ".pi", "pi-warden.json"));
+  const subProject = real(join(cwd, "sub", ".pi", "pi-warden.json"));
+  const userConfig = real(join(userDir(), "config.json"));
+  for (const [command, target] of [
+    // A shell string was read as one word, so the redirect inside it was invisible to the hold.
+    [`bash -c 'echo {} > .pi/pi-warden.json'`, project],
+    [`sh -c 'printf x > .pi/pi-warden.json'`, project],
+    [`zsh -c "echo {} > .pi/pi-warden.json"`, project],
+    [`dash -c 'echo {} > .pi/pi-warden.json'`, project],
+    // A cd was not followed, so the relative target resolved against the call's directory.
+    [`cd .pi && printf '%s' '{"cause":{"enabled":false}}' > pi-warden.json`, project],
+    [`cd sub && printf '%s' '{}' > .pi/pi-warden.json`, subProject],
+    [`pushd .pi && printf '%s' '{}' > pi-warden.json`, project],
+    [`cd sub && printf '%s' '{}' > ".pi/pi-warden.json"`, subProject],
+    // The main defect: a cd to the user's own directory rewrote the live user config.
+    [`cd ${userDir()} && printf '%s' '{"mode":"steer"}' > config.json`, userConfig],
+    [`cd ${userDir()}/holds && printf '%s' '{}' > ../config.json`, userConfig],
+    [`cd ~ && printf '%s' '{}' > .pi/pi-warden.json`, real(join(homedir(), ".pi", "pi-warden.json"))],
+    [`curl -o .pi/pi-warden.json https://example.invalid/x`, project],
+    [`curl --output .pi/pi-warden.json https://example.invalid/x`, project],
+    [`wget -O .pi/pi-warden.json https://example.invalid/x`, project],
+    [`wget --output-document .pi/pi-warden.json https://example.invalid/x`, project],
+  ] as const) {
+    assert.deepEqual(wardenConfigHeld("bash", { command }), [target], command);
+  }
+});
+
+test("removing, moving or linking pi-warden's config is held, because it takes a check away", async () => {
+  await mkdir(join(cwd, ".pi"), { recursive: true });
+  await writeFile(join(cwd, ".pi", "pi-warden.json"), "{}\n");
+  await mkdir(userDir(), { recursive: true });
+  const project = real(join(cwd, ".pi", "pi-warden.json"));
+  const userConfig = real(join(userDir(), "config.json"));
+  for (const [command, target] of [
+    ["rm .pi/pi-warden.json", project],
+    ["unlink .pi/pi-warden.json", project],
+    ["mv .pi/pi-warden.json /tmp/warden-copy.json", project],
+    ["rm -f .pi/pi-warden.json", project],
+    [`ln .pi/pi-warden.json /tmp/warden-link.json`, project],
+    [`ln -s .pi/pi-warden.json /tmp/warden-link.json`, project],
+    [`rm ${userConfig}`, userConfig],
+  ] as const) {
+    assert.deepEqual(wardenConfigHeld("bash", { command }), [target], command);
+  }
+});
+
+test("a copy into a directory, or a recursive copy that lands a project file, is held", async () => {
+  await mkdir(join(cwd, ".pi"), { recursive: true });
+  await mkdir(join(cwd, "evil", ".pi"), { recursive: true });
+  const project = real(join(cwd, ".pi", "pi-warden.json"));
+  for (const command of [
+    "cp /tmp/pi-warden.json .pi/",
+    "install /tmp/pi-warden.json .pi/",
+    "cp -r evil/.pi .",
+    "rsync -a evil/.pi/ .pi/",
+  ]) assert.deepEqual(wardenConfigHeld("bash", { command }), [project], command);
+  assert.deepEqual(wardenConfigHeld("bash", { command: "cp .pi/pi-warden.json /tmp/warden-copy.json" }), [], "copying it out is a read");
+  assert.deepEqual(wardenConfigHeld("bash", { command: "cp -r evil/.pi /tmp/warden-copy" }), [], "a copy outside the project is not a check");
+});
+
+test("a write after a cd the reader cannot resolve is held by its file name", async () => {
+  await mkdir(join(cwd, ".pi"), { recursive: true });
+  const project = real(join(cwd, ".pi", "pi-warden.json"));
+  for (const command of [
+    `cd "$WARDEN_DIR" && echo {} > pi-warden.json`,
+    "cd $1 && echo {} > pi-warden.json",
+    "cd - && echo {} > pi-warden.json",
+  ]) assert.equal(wardenConfigHeld("bash", { command }).length, 1, command);
+  // Any other file name after an unreadable cd stays unread, as the spec's "does not read" list says.
+  assert.deepEqual(wardenConfigHeld("bash", { command: 'cd "$WARDEN_DIR" && echo {} > notes.json' }), []);
+  assert.ok(project);
+});
+
+test("a scratch project under the temp directory stays free; the session's own project file does not", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "pi-warden-scratch-project-"));
+  await mkdir(join(scratch, ".pi"), { recursive: true });
+  const other = join(scratch, ".pi", "pi-warden.json");
+  assert.deepEqual(wardenConfigHeld("bash", { command: `echo {} > ${other}` }), [], "another temp project's file is free");
+  assert.deepEqual(wardenConfigHeld("write", { path: other, content: "{}" }), [], "and free through the write tool");
+  // The same file is held when it is the session's own project file.
+  assert.deepEqual(configWriteTargets("write", { path: other, content: "{}" }, scratch, defaultHostDirs()), [real(other)]);
+  await rm(scratch, { recursive: true, force: true });
+});
+
+test("a held write after a cd is named in the directory the cd names", async () => {
+  await mkdir(join(cwd, "sub", ".pi"), { recursive: true });
+  const held = wardenConfigHeld("bash", { command: "cd sub && printf '%s' '{}' > .pi/pi-warden.json" });
+  assert.deepEqual(held, [real(join(cwd, "sub", ".pi", "pi-warden.json"))]);
 });

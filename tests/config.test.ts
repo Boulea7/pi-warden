@@ -639,11 +639,63 @@ test("the loosened set is recorded per project: a missing or unreadable record s
   const other = join(temporary, "other-project");
   await mkdir(other, { recursive: true });
   assert.equal(readLoosenRecord(project), undefined, "no record yet");
-  writeLoosenRecord(project, ["done-check"]);
-  assert.deepEqual(readLoosenRecord(project), ["done-check"]);
+  writeLoosenRecord(project, [{ name: "done-check" }]);
+  assert.deepEqual(readLoosenRecord(project), [{ name: "done-check" }]);
+  writeLoosenRecord(project, [{ name: "cause-check", detail: "claims-cause threshold 0.7 → 0.95" }]);
+  assert.deepEqual(readLoosenRecord(project), [{ name: "cause-check", detail: "claims-cause threshold 0.7 → 0.95" }], "the detail is kept, so a further loosening of a named check shows again");
   assert.equal(readLoosenRecord(other), undefined, "another project has its own record");
   await writeFile(loosenRecordPath(project), "{ not json");
   assert.equal(readLoosenRecord(project), undefined, "an unreadable record shows the line again");
+  // A record written before details were kept is not the same set: the line shows once more after the upgrade.
+  await writeFile(loosenRecordPath(project), JSON.stringify({ version: 1, loosened: ["cause-check"] }));
+  assert.equal(readLoosenRecord(project), undefined, "a names-only record reads as differs");
   await rm(loosenRecordPath(project), { force: true });
   await rm(other, { recursive: true, force: true });
+});
+
+test("the notice names every real loosening: switches, thresholds, lists and visual tools", () => {
+  const user = defaultConfig();
+  const of = (raw: unknown) => loosenedChecks(user, applyProjectOverrides(user, raw));
+  const named = (raw: unknown) => of(raw).map(check => check.name);
+  for (const [raw, name] of [
+    [{ slop: { prose: { enabled: false } } }, "slop-check"],
+    [{ rules: { fallback: false } }, "rules-check"],
+    [{ rules: { maxChars: 500 } }, "rules-check"],
+    [{ stuck: { minFailures: 9 } }, "stuck-check"],
+    [{ waste: { enabled: false } }, "waste note"],
+    [{ context: { largeOutput: { enabled: false } } }, "large-output notice"],
+    [{ cause: { windowDays: 90 } }, "cause-check"],
+    [{ done: { claimsDone: 0.95 } }, "done-check"],
+    [{ done: { uiProof: false } }, "done-check"],
+  ] as const) assert.ok(named(raw).includes(name), JSON.stringify(raw));
+  // A project file can switch notifications off only from an on user value.
+  const notifyOn = applyUserOverrides(user, { notify: { enabled: true } });
+  assert.ok(loosenedChecks(notifyOn, applyProjectOverrides(notifyOn, { notify: { enabled: false } })).some(check => check.name === "notify"), "notify");
+  // A project list replaces the user's: an added visual tool loosens, a removed one tightens.
+  const added = of({ done: { visualTools: { commands: [...user.done.visualTools.commands, "screenshot.sh"] } } });
+  assert.equal(added.length, 1);
+  assert.match(added[0]!.detail ?? "", /screenshot\.sh/);
+  assert.deepEqual(of({ done: { visualTools: { tools: [] } } }), [], "no visual tool is stricter");
+  // A stricter value loosens nothing.
+  assert.deepEqual(of({ rules: { threshold: 0.5 }, stuck: { minFailures: 1 }, cause: { windowDays: 2 } }), []);
+});
+
+test("every key a project file can set is classified as loosening a check or not a check", async () => {
+  const table = (await import("../src/config.js") as unknown as { PROJECT_KEYS?: Record<string, { kind: string; why?: string; check?: string }> }).PROJECT_KEYS;
+  assert.ok(table, "the classification table is exported");
+  const leaves: string[] = [];
+  const walk = (value: unknown, path: string): void => {
+    if (Array.isArray(value) || value === null || typeof value !== "object" || Object.keys(value).length === 0) { leaves.push(path); return; }
+    for (const [key, inner] of Object.entries(value)) walk(inner, path ? `${path}.${key}` : key);
+  };
+  walk(defaultConfig(), "");
+  // The top-level keys applyProjectOverrides can replace, or set for a project.
+  const projectSections = new Set(["enabled", "action", "stuck", "done", "cause", "slop", "security", "rules", "rulesAtTurnStart", "context", "runaway", "notify", "judge", "subagent", "waste", "compaction", "prefs"]);
+  const unclassified = leaves.filter(path => projectSections.has(path.split(".")[0]!) && table![path] === undefined);
+  assert.deepEqual(unclassified, []);
+  const stale = Object.keys(table!).filter(path => !leaves.includes(path));
+  assert.deepEqual(stale, [], "a table row for a key that no longer exists");
+  for (const [path, entry] of Object.entries(table!)) {
+    assert.ok(entry.kind === "none" ? Boolean(entry.why && entry.why.length) : Boolean(entry.check), `${path} says why it is not a check, or which check it loosens`);
+  }
 });

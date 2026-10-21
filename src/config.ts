@@ -1342,64 +1342,206 @@ export interface LoosenedCheck {
   detail?: string;
 }
 
-const SWITCHED_OFF: ReadonlyArray<[string, (config: WardenConfig) => boolean]> = [
-  ["done-check", config => config.done.enabled],
-  ["done-check nudge", config => config.done.nudge],
-  ["done-check UI proof", config => config.done.uiProof],
-  ["cause-check", config => config.cause.enabled],
-  ["cause-check nudge", config => config.cause.nudge],
-  ["stuck-check", config => config.stuck.enabled],
-  ["stuck-check nudge", config => config.stuck.nudge],
-  ["stuck-check repeat steer", config => config.stuck.repeatSteer],
-  ["slop-check", config => config.slop.enabled],
-  ["rules-check", config => config.rules.enabled],
-  ["runaway stop", config => config.runaway.enabled],
-  ["subagent triage", config => config.subagent.enabled],
-];
+/** How a project value loosens the check it tunes. */
+export type ProjectKeyKind = "off" | "high" | "low" | "fewer" | "more" | "scale" | "none";
 
-const RAISED: ReadonlyArray<[string, string, (config: WardenConfig) => number]> = [
-  ["done-check", "claims-done threshold", config => config.done.claimsDone],
-  ["cause-check", "claims-cause threshold", config => config.cause.claimsCause],
-  ["slop-check", "threshold", config => config.slop.threshold],
-  ["rules-check", "threshold", config => config.rules.threshold],
-  ["rules-check", "soft threshold", config => config.rules.softThreshold],
-  ["stuck-check", "same-strategy threshold", config => config.stuck.sameStrategy],
-  ["action guard", "irreversible hold", config => config.action.irreversible.confirm],
-  ["action guard", "irreversible warn", config => config.action.irreversible.warn],
-  ["off-task steer", "warn", config => config.action.offTask.warn],
-  ["off-task steer", "steer", config => config.action.offTask.steer],
-  ["security", "threshold", config => config.security.threshold],
-  ["judge", "cooldown", config => config.judge.cooldownMs],
-];
+/** One key a project file can set: the check it loosens, and how; or why it is not a check. */
+export interface ProjectKeyClass {
+  kind: ProjectKeyKind;
+  /** The check, named as `/warden status` names it; absent only when the key is not a check. */
+  check?: string;
+  /** What moves, as the line's detail names it (`threshold`, `UI files`). */
+  label?: string;
+  /** Loosest first, for a named option list. */
+  order?: readonly string[];
+  /** Why this key is not a check; required when kind is "none". */
+  why?: string;
+}
 
-const FEWER: ReadonlyArray<[string, string, (config: WardenConfig) => readonly string[]]> = [
-  ["rules-check", "files", config => config.rules.files],
-  ["done-check", "UI files", config => config.done.uiFiles],
-];
+/**
+ * Every key a project file can set, classified: a direction that loosens a check, or "none" with the reason it is not
+ * one. A test walks every leaf of `defaultConfig()` in a project section and fails when a key has no row here, so a
+ * config key added later cannot quietly loosen a check without being named in the session-start line.
+ * The action guard and security rows that a project can only tighten (`projectProbability`, `projectSwitch`) are "none":
+ * the loader refuses the looser value, so the notice has nothing to say about it.
+ */
+export const PROJECT_KEYS: Readonly<Record<string, ProjectKeyClass>> = {
+  "stuck.enabled": { kind: "off", check: "stuck-check" },
+  "stuck.minFailures": { kind: "high", check: "stuck-check", label: "failures needed" },
+  "stuck.sameStrategy": { kind: "high", check: "stuck-check", label: "same-strategy threshold" },
+  "stuck.churnThreshold": { kind: "high", check: "stuck-check", label: "churn threshold" },
+  "stuck.cooldown": { kind: "high", check: "stuck-check", label: "cooldown" },
+  "stuck.nudge": { kind: "off", check: "stuck-check", label: "nudge" },
+  "stuck.repeatSteer": { kind: "off", check: "stuck-check", label: "repeat steer" },
+  "stuck.evidence": { kind: "off", check: "stuck-check", label: "evidence" },
+  "stuck.diffLimit": { kind: "low", check: "stuck-check", label: "diff limit" },
+  "stuck.tailLimit": { kind: "low", check: "stuck-check", label: "tail limit" },
+  "stuck.window": { kind: "none", why: "a cap on minFailures, which decides on its own" },
 
-const MORE: ReadonlyArray<[string, string, (config: WardenConfig) => readonly string[]]> = [
-  ["rules-check", "excluded paths", config => config.rules.exclude],
-  ["rules-check", "skipped paths", config => config.rules.skip],
-];
+  "done.enabled": { kind: "off", check: "done-check" },
+  "done.claimsDone": { kind: "high", check: "done-check", label: "claims-done threshold" },
+  "done.nudge": { kind: "off", check: "done-check", label: "nudge" },
+  "done.uiProof": { kind: "off", check: "done-check", label: "UI proof" },
+  "done.uiFiles": { kind: "fewer", check: "done-check", label: "UI files" },
+  "done.visualTools.commands": { kind: "more", check: "done-check", label: "visual commands" },
+  "done.visualTools.commandWords": { kind: "more", check: "done-check", label: "visual command words" },
+  "done.visualTools.tools": { kind: "more", check: "done-check", label: "visual tools" },
+  "done.visualTools.images": { kind: "more", check: "done-check", label: "visual image types" },
+
+  "cause.enabled": { kind: "off", check: "cause-check" },
+  "cause.claimsCause": { kind: "high", check: "cause-check", label: "claims-cause threshold" },
+  "cause.nudge": { kind: "off", check: "cause-check", label: "nudge" },
+  "cause.windowDays": { kind: "high", check: "cause-check", label: "window days" },
+
+  "slop.enabled": { kind: "off", check: "slop-check" },
+  "slop.threshold": { kind: "high", check: "slop-check", label: "threshold" },
+  "slop.prose.enabled": { kind: "off", check: "slop-check", label: "prose" },
+  "slop.prose.threshold": { kind: "high", check: "slop-check", label: "prose threshold" },
+  "slop.prose.trend": { kind: "high", check: "slop-check", label: "prose trend" },
+  "slop.prose.minChars": { kind: "high", check: "slop-check", label: "prose minimum chars" },
+  "slop.prose.audience": { kind: "none", why: "who the prose is written for, not a threshold" },
+
+  "rules.enabled": { kind: "off", check: "rules-check" },
+  "rules.threshold": { kind: "high", check: "rules-check", label: "threshold" },
+  "rules.softThreshold": { kind: "high", check: "rules-check", label: "soft threshold" },
+  "rules.fallback": { kind: "off", check: "rules-check", label: "fallback" },
+  "rules.maxChars": { kind: "low", check: "rules-check", label: "rules text limit" },
+  "rules.files": { kind: "fewer", check: "rules-check", label: "files" },
+  "rules.exclude": { kind: "more", check: "rules-check", label: "excluded paths" },
+  "rules.skip": { kind: "more", check: "rules-check", label: "skipped paths" },
+  "rules.sensitivePaths": { kind: "fewer", check: "rules-check", label: "sensitive-path notes" },
+
+  "rulesAtTurnStart.enabled": { kind: "none", why: "a project can only switch it on; switching it off is refused at load" },
+  "rulesAtTurnStart.threshold": { kind: "none", why: "a project can only lower it, which names more rules" },
+
+  "security.enabled": { kind: "none", why: "a project cannot switch security off; the value is refused at load" },
+  "security.threshold": { kind: "none", why: "a project cannot raise the threshold; the value is refused at load" },
+  "security.maskOutput": { kind: "none", why: "user file only: a repository must not unmask credentials" },
+  "security.shareLinkParams": { kind: "none", why: "user file only: it excuses a share-link token" },
+
+  "action.enabled": { kind: "none", why: "a project can only switch the guard on; switching it off is refused" },
+  "action.tools": { kind: "none", why: "a project can only add guarded tools, which guards more" },
+  "action.failOpen": { kind: "none", why: "a project cannot turn fail-open on; the value is refused" },
+  "action.ask.enabled": { kind: "none", why: "a project can only switch the ask gate on" },
+  "action.traceSample": { kind: "none", why: "how much trace-only signal is sampled, not a call decision" },
+  "action.timeoutMs": { kind: "none", why: "user file only" },
+  "action.irreversible.warn": { kind: "none", why: "a project cannot raise the warn threshold; the value is refused" },
+  "action.irreversible.confirm": { kind: "none", why: "a project cannot raise the hold threshold; the value is refused" },
+  "action.offTask.warn": { kind: "high", check: "off-task steer", label: "warn threshold" },
+  "action.offTask.steer": { kind: "high", check: "off-task steer", label: "steer threshold" },
+  "action.intentMismatch": { kind: "high", check: "intent-mismatch steer", label: "threshold" },
+  "action.visibleMismatch": { kind: "high", check: "intent-mismatch steer", label: "visible-action threshold" },
+  "action.intentTraceOnly": { kind: "scale", check: "intent-mismatch steer", label: "trace-only mode", order: ["none", "invisible", "all"] },
+  "action.shouldProceed.threshold": { kind: "high", check: "should-proceed steer", label: "threshold" },
+  "action.shouldProceed.steer": { kind: "off", check: "should-proceed steer" },
+  "action.feedbackLog": { kind: "none", why: "the hold record, not a check" },
+  "action.commandRules": { kind: "none", why: "user file only" },
+  "action.commandDenyRules": { kind: "none", why: "user file only" },
+  "action.exemptRules": { kind: "none", why: "user file only" },
+  "action.pathRules": { kind: "none", why: "user file only" },
+  "action.armingRules": { kind: "none", why: "user file only" },
+  "action.escalationThreshold": { kind: "high", check: "escalation", label: "threshold" },
+  "action.floor": { kind: "none", why: "user file only" },
+
+  "context.enabled": { kind: "off", check: "context-check" },
+  "context.tailMinChars": { kind: "none", why: "how output is trimmed, not a check" },
+  "context.confidence": { kind: "none", why: "how a retention answer is trusted" },
+  "context.duplicateMinChars": { kind: "none", why: "when an output counts as a repeat" },
+  "context.recallTool": { kind: "none", why: "which tool recalls a stored output" },
+  "context.formatConfidence": { kind: "none", why: "how a named output format is trusted" },
+  "context.compactAppendix": { kind: "none", why: "an appendix after compaction" },
+  "context.dedupeRuns": { kind: "none", why: "repeated outputs in one run" },
+  "context.dedupeMessages": { kind: "none", why: "repeated outputs across messages" },
+  "context.largeOutput.enabled": { kind: "off", check: "large-output notice" },
+  "context.largeOutput.threshold": { kind: "high", check: "large-output notice", label: "threshold" },
+  "context.filter.enabled": { kind: "none", why: "user file only: it sends whole outputs to the judge" },
+  "context.filter.chunkChars": { kind: "none", why: "how a filtered output is chunked" },
+  "context.filter.minScore": { kind: "none", why: "how a filtered chunk is scored" },
+  "context.filter.maxKeptChars": { kind: "none", why: "how much of a filtered output is kept" },
+  "context.filter.timeoutMs": { kind: "none", why: "the filter's own deadline" },
+
+  "runaway.enabled": { kind: "off", check: "runaway stop" },
+  "runaway.repeats": { kind: "high", check: "runaway stop", label: "text repeats" },
+  "runaway.thinkingRepeats": { kind: "high", check: "runaway stop", label: "thinking repeats" },
+  "runaway.minChars": { kind: "high", check: "runaway stop", label: "minimum chars" },
+  "runaway.recover": { kind: "none", why: "what happens after a runaway stop, not the stop" },
+
+  "notify.enabled": { kind: "off", check: "notify" },
+  "notify.cooldownMs": { kind: "high", check: "notify", label: "cooldown" },
+  "notify.command": { kind: "none", why: "user file only: a project never names a command" },
+
+  "judge.cooldownMs": { kind: "high", check: "judge", label: "cooldown" },
+  "judge.failuresBeforeCooldown": { kind: "none", why: "how a failing backend is cooled down" },
+
+  "subagent.enabled": { kind: "off", check: "subagent triage" },
+  "subagent.wake": { kind: "off", check: "subagent wake" },
+  "subagent.observer": { kind: "off", check: "subagent observer" },
+  "subagent.threshold": { kind: "high", check: "subagent wake", label: "threshold" },
+  "subagent.cooldownMs": { kind: "high", check: "subagent wake", label: "cooldown" },
+
+  "waste.enabled": { kind: "off", check: "waste note" },
+  "waste.tip": { kind: "off", check: "waste tip" },
+  "waste.every": { kind: "high", check: "waste note", label: "calls between notes" },
+  "waste.sleep": { kind: "off", check: "waste sleep note" },
+  "waste.paging": { kind: "off", check: "waste paging note" },
+  "waste.search": { kind: "off", check: "waste search note" },
+  "waste.recheck": { kind: "off", check: "waste recheck note" },
+
+  "compaction.enabled": { kind: "none", why: "user file only: turning it on spends requests" },
+  "compaction.keepThreshold": { kind: "none", why: "how much context is kept" },
+  "compaction.maxSummaryTokens": { kind: "none", why: "the summary's size" },
+  "compaction.timeoutMs": { kind: "none", why: "the compaction deadline" },
+  "compaction.maxRequests": { kind: "none", why: "the compaction budget" },
+  "compaction.skipProviders": { kind: "none", why: "which providers keep their own summary" },
+
+  "prefs.enabled": { kind: "none", why: "standing preferences are context, not a check" },
+  "prefs.inject": { kind: "none", why: "standing preferences are context, not a check" },
+
+  enabled: { kind: "none", why: "a project can only switch pi-warden on; switching it off is refused" },
+};
+
+/** A config value by its dotted path. */
+function valueAt(config: WardenConfig, path: string): unknown {
+  let current: unknown = config;
+  for (const part of path.split(".")) {
+    if (current === null || typeof current !== "object") return undefined;
+    current = (current as Record<string, unknown>)[part];
+  }
+  return current;
+}
+
+/** A list value as the items a project file adds or leaves out; a map counts by its keys. */
+function itemsOf(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String);
+  if (value !== null && typeof value === "object") return Object.keys(value);
+  return [];
+}
 
 /** Every check `layered` loosens compared with `user`, in a stable order. Empty when the project file loosens nothing. */
 export function loosenedChecks(user: WardenConfig, layered: WardenConfig): LoosenedCheck[] {
   const checks: LoosenedCheck[] = [];
-  for (const [name, on] of SWITCHED_OFF) if (on(user) && !on(layered)) checks.push({ name });
-  for (const [name, detail, value] of RAISED) {
-    const before = value(user);
-    const after = value(layered);
-    if (after > before) checks.push({ name, detail: `${detail} ${before} → ${after}` });
-  }
-  for (const [name, detail, value] of FEWER) {
-    const after = value(layered);
-    const lost = value(user).filter(item => !after.includes(item));
-    if (lost.length) checks.push({ name, detail: `${detail} left out: ${lost.join(", ")}` });
-  }
-  for (const [name, detail, value] of MORE) {
-    const before = value(user);
-    const added = value(layered).filter(item => !before.includes(item));
-    if (added.length) checks.push({ name, detail: `${detail} added: ${added.join(", ")}` });
+  for (const [path, entry] of Object.entries(PROJECT_KEYS)) {
+    if (entry.kind === "none") continue;
+    const before = valueAt(user, path);
+    const after = valueAt(layered, path);
+    const name = entry.check!;
+    if (entry.kind === "off") {
+      if (before === true && after === false) checks.push({ name, ...(entry.label === undefined ? {} : { detail: entry.label }) });
+      continue;
+    }
+    if (entry.kind === "high" || entry.kind === "low") {
+      if (typeof before !== "number" || typeof after !== "number") continue;
+      if (entry.kind === "high" ? after > before : after < before) checks.push({ name, detail: `${entry.label ?? "value"} ${before} → ${after}` });
+      continue;
+    }
+    if (entry.kind === "scale") {
+      const order = entry.order ?? [];
+      const moved = order.indexOf(String(before)) > order.indexOf(String(after)) && order.includes(String(before)) && order.includes(String(after));
+      if (moved) checks.push({ name, detail: `${entry.label ?? "mode"} ${String(before)} → ${String(after)}` });
+      continue;
+    }
+    const lost = entry.kind === "fewer" ? itemsOf(before).filter(item => !itemsOf(after).includes(item)) : itemsOf(after).filter(item => !itemsOf(before).includes(item));
+    if (lost.length) checks.push({ name, detail: `${entry.label ?? "entries"} ${entry.kind === "fewer" ? "left out" : "added"}: ${lost.join(", ")}` });
   }
   return checks;
 }
@@ -1417,16 +1559,28 @@ export function loosenRecordPath(cwd: string, dirs: HostDirs = defaultHostDirs()
   return join(dirname(userConfigPath(dirs)), "project-config", `${project}.json`);
 }
 
-/** The check names last recorded for this project; undefined when no record exists or it cannot be read, which shows the line. */
-export function readLoosenRecord(cwd: string, dirs: HostDirs = defaultHostDirs()): string[] | undefined {
+/** The checks last recorded for this project; undefined when no record exists, it cannot be read, or it predates
+ *  details (a names-only record is a different set, so the line shows once more after the upgrade). */
+export function readLoosenRecord(cwd: string, dirs: HostDirs = defaultHostDirs()): LoosenedCheck[] | undefined {
   const raw = readJson(loosenRecordPath(cwd, dirs));
-  const names = raw?.loosened;
-  return Array.isArray(names) && names.every((name): name is string => typeof name === "string") ? names : undefined;
+  if (raw?.version !== 2 || !Array.isArray(raw.loosened)) return undefined;
+  const checks: LoosenedCheck[] = [];
+  for (const item of raw.loosened) {
+    if (!isObject(item) || typeof item.name !== "string") return undefined;
+    if (item.detail !== undefined && typeof item.detail !== "string") return undefined;
+    checks.push({ name: item.name, ...(typeof item.detail === "string" ? { detail: item.detail } : {}) });
+  }
+  return checks;
 }
 
-/** Records the loosened set now shown for this project, so the same set stays quiet until it changes. */
-export function writeLoosenRecord(cwd: string, names: readonly string[], dirs: HostDirs = defaultHostDirs()): void {
-  writeFileAtomicSync(loosenRecordPath(cwd, dirs), `${JSON.stringify({ version: 1, loosened: [...names] }, null, 2)}\n`);
+/** Records the loosened set now shown for this project, so the same set stays quiet until it changes. A read-only
+ *  agent directory must not stop a session: the record is an optimisation, and an unwritable one shows the line again. */
+export function writeLoosenRecord(cwd: string, checks: readonly LoosenedCheck[], dirs: HostDirs = defaultHostDirs()): void {
+  try {
+    writeFileAtomicSync(loosenRecordPath(cwd, dirs), `${JSON.stringify({ version: 2, loosened: checks.map(check => (check.detail === undefined ? { name: check.name } : { name: check.name, detail: check.detail })) }, null, 2)}\n`);
+  } catch (error) {
+    console.warn("pi-warden: could not record the loosened project checks:", error instanceof Error ? error.stack ?? error.message : String(error));
+  }
 }
 
 export function loadConfig(options: LoadOptions = {}): WardenConfig {

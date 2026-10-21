@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { after, before, beforeEach, test, type TestContext } from "node:test";
 import { createEventBus, DefaultResourceLoader, SettingsManager, type EventBus } from "@earendil-works/pi-coding-agent";
@@ -6265,6 +6265,76 @@ test("the project file is read once per session: a mid-run edit lands at the nex
   await runCommand("status");
   assert.doesNotMatch(notices.at(-1)!.text, /done-check/, "the next session reads the file");
   await clearProjectConfig();
+});
+
+test("the shell shapes that rewrote pi-warden's config in an independent check are blocked with no UI", async () => {
+  await writeConfig(JSON.stringify({ notices: true, rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const headless = context({ hasUI: false });
+  const userConfig = join(process.env.PI_CODING_AGENT_DIR!, "pi-warden", "config.json");
+  const before = await readFile(userConfig, "utf8");
+  for (const command of [
+    "bash -c 'echo {} > .pi/pi-warden.json'",
+    `cd .pi && printf '%s' '{"cause":{"enabled":false}}' > pi-warden.json`,
+    `cd ${join(process.env.PI_CODING_AGENT_DIR!, "pi-warden")} && printf '%s' '{"rules":{"enabled":false}}' > config.json`,
+    "sh -c 'printf x > .pi/pi-warden.json'",
+  ]) {
+    const result = await toolCall("bash", { command }, headless);
+    assert.equal(result?.block, true, command);
+    assert.match(result!.reason!, /pi-warden's own config/);
+  }
+  assert.equal(existsSync(projectConfig()), false, "the project file is not written");
+  assert.equal(await readFile(userConfig, "utf8"), before, "the live user config is not written");
+  await runCommand("status", headless);
+  assert.ok(notices.length > 0, "the session still answers after the attempts");
+  await clearProjectConfig();
+});
+
+test("a further loosening of an already-named check shows the line again", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const lines = () => notices.filter(notice => notice.text.startsWith("This project's"));
+  await writeFile(projectConfig(), JSON.stringify({ cause: { enabled: false } }));
+  notices.length = 0;
+  await sessionStart();
+  assert.match(lines().at(-1)!.text, /cause-check/);
+  assert.doesNotMatch(lines().at(-1)!.text, /claims-cause/);
+  // The check comes back on, raised: the name is already recorded, the detail is not, so the line shows again.
+  await writeFile(projectConfig(), JSON.stringify({ cause: { claimsCause: 0.95 } }));
+  notices.length = 0;
+  await sessionStart();
+  assert.equal(lines().length, 1);
+  assert.match(lines().at(-1)!.text, /claims-cause threshold 0\.7 → 0\.95/);
+  notices.length = 0;
+  await sessionStart();
+  assert.deepEqual(lines(), [], "the same set with the same detail stays quiet");
+  await clearProjectConfig();
+});
+
+test("a read-only agent directory does not stop a session, and the loosening line still shows", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await writeFile(projectConfig(), JSON.stringify({ done: { enabled: false } }));
+  const recordDir = dirname(loosenRecordPath(temporary));
+  await mkdir(recordDir, { recursive: true });
+  await rm(loosenRecordPath(temporary), { force: true });
+  await chmod(recordDir, 0o555);
+  try {
+    await sessionStart();
+    const lines = notices.filter(notice => notice.text.startsWith("This project's"));
+    assert.equal(lines.length, 1, "the line shows although the record cannot be written");
+    assert.match(lines[0]!.text, /done-check/);
+    await runCommand("status");
+    assert.ok(notices.length > 1, "the rest of the session still runs");
+  } finally {
+    await chmod(recordDir, 0o755);
+    await clearProjectConfig();
+  }
 });
 
 test("a loosened project file shows one line at session start, once for that set", async () => {
