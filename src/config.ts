@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { writeFileAtomicSync } from "./atomic.js";
 import type { JudgmentBackend } from "./backend.js";
@@ -1317,13 +1318,123 @@ export interface LoadOptions {
   projectTrusted?: boolean;
   /** Host directories; defaults to `defaultHostDirs()`. */
   dirs?: HostDirs;
+  /**
+   * The project file as the session read it once at its start. A session that passes one never re-reads the file, so a
+   * mid-run edit lands at the next session. Omitted, the file is read on every call, as a library caller expects.
+   */
+  projectRaw?: { value: unknown } | undefined;
+}
+
+/** The project file's content, read without applying anything: the session snapshot is taken from here. */
+export function readProjectConfig(cwd: string, dirs: HostDirs = defaultHostDirs()): unknown {
+  return readJson(projectConfigPath(cwd, dirs));
+}
+
+/**
+ * The checks a project file loosens compared with the user's own config. The project file cannot weaken the action guard
+ * or security (those values are refused with a warning at load), so what is compared here is every other check it can
+ * switch off, move a threshold on, or take a file out of.
+ */
+export interface LoosenedCheck {
+  /** The check, named as `/warden status` names it. */
+  name: string;
+  /** How it loosens; absent when the project file simply switches the check off. */
+  detail?: string;
+}
+
+const SWITCHED_OFF: ReadonlyArray<[string, (config: WardenConfig) => boolean]> = [
+  ["done-check", config => config.done.enabled],
+  ["done-check nudge", config => config.done.nudge],
+  ["done-check UI proof", config => config.done.uiProof],
+  ["cause-check", config => config.cause.enabled],
+  ["cause-check nudge", config => config.cause.nudge],
+  ["stuck-check", config => config.stuck.enabled],
+  ["stuck-check nudge", config => config.stuck.nudge],
+  ["stuck-check repeat steer", config => config.stuck.repeatSteer],
+  ["slop-check", config => config.slop.enabled],
+  ["rules-check", config => config.rules.enabled],
+  ["runaway stop", config => config.runaway.enabled],
+  ["subagent triage", config => config.subagent.enabled],
+];
+
+const RAISED: ReadonlyArray<[string, string, (config: WardenConfig) => number]> = [
+  ["done-check", "claims-done threshold", config => config.done.claimsDone],
+  ["cause-check", "claims-cause threshold", config => config.cause.claimsCause],
+  ["slop-check", "threshold", config => config.slop.threshold],
+  ["rules-check", "threshold", config => config.rules.threshold],
+  ["rules-check", "soft threshold", config => config.rules.softThreshold],
+  ["stuck-check", "same-strategy threshold", config => config.stuck.sameStrategy],
+  ["action guard", "irreversible hold", config => config.action.irreversible.confirm],
+  ["action guard", "irreversible warn", config => config.action.irreversible.warn],
+  ["off-task steer", "warn", config => config.action.offTask.warn],
+  ["off-task steer", "steer", config => config.action.offTask.steer],
+  ["security", "threshold", config => config.security.threshold],
+  ["judge", "cooldown", config => config.judge.cooldownMs],
+];
+
+const FEWER: ReadonlyArray<[string, string, (config: WardenConfig) => readonly string[]]> = [
+  ["rules-check", "files", config => config.rules.files],
+  ["done-check", "UI files", config => config.done.uiFiles],
+];
+
+const MORE: ReadonlyArray<[string, string, (config: WardenConfig) => readonly string[]]> = [
+  ["rules-check", "excluded paths", config => config.rules.exclude],
+  ["rules-check", "skipped paths", config => config.rules.skip],
+];
+
+/** Every check `layered` loosens compared with `user`, in a stable order. Empty when the project file loosens nothing. */
+export function loosenedChecks(user: WardenConfig, layered: WardenConfig): LoosenedCheck[] {
+  const checks: LoosenedCheck[] = [];
+  for (const [name, on] of SWITCHED_OFF) if (on(user) && !on(layered)) checks.push({ name });
+  for (const [name, detail, value] of RAISED) {
+    const before = value(user);
+    const after = value(layered);
+    if (after > before) checks.push({ name, detail: `${detail} ${before} → ${after}` });
+  }
+  for (const [name, detail, value] of FEWER) {
+    const after = value(layered);
+    const lost = value(user).filter(item => !after.includes(item));
+    if (lost.length) checks.push({ name, detail: `${detail} left out: ${lost.join(", ")}` });
+  }
+  for (const [name, detail, value] of MORE) {
+    const before = value(user);
+    const added = value(layered).filter(item => !before.includes(item));
+    if (added.length) checks.push({ name, detail: `${detail} added: ${added.join(", ")}` });
+  }
+  return checks;
+}
+
+/** The one line a session start shows for a loosened set: what the project file takes away, and from which file. */
+export function loosenNotice(checks: readonly LoosenedCheck[], dirs: HostDirs = defaultHostDirs()): string {
+  const items = checks.map(check => (check.detail === undefined ? check.name : `${check.name} (${check.detail})`));
+  const verb = checks.every(check => check.detail === undefined) ? "switches off" : "loosens";
+  return `This project's ${join(dirs.configDirName, PROJECT_CONFIG_FILE)} ${verb}: ${items.join(", ")}.`;
+}
+
+/** Where the last loosened set for a project is kept: beside the user config, keyed by the project path. */
+export function loosenRecordPath(cwd: string, dirs: HostDirs = defaultHostDirs()): string {
+  const project = createHash("sha256").update(cwd).digest("hex").slice(0, 12);
+  return join(dirname(userConfigPath(dirs)), "project-config", `${project}.json`);
+}
+
+/** The check names last recorded for this project; undefined when no record exists or it cannot be read, which shows the line. */
+export function readLoosenRecord(cwd: string, dirs: HostDirs = defaultHostDirs()): string[] | undefined {
+  const raw = readJson(loosenRecordPath(cwd, dirs));
+  const names = raw?.loosened;
+  return Array.isArray(names) && names.every((name): name is string => typeof name === "string") ? names : undefined;
+}
+
+/** Records the loosened set now shown for this project, so the same set stays quiet until it changes. */
+export function writeLoosenRecord(cwd: string, names: readonly string[], dirs: HostDirs = defaultHostDirs()): void {
+  writeFileAtomicSync(loosenRecordPath(cwd, dirs), `${JSON.stringify({ version: 1, loosened: [...names] }, null, 2)}\n`);
 }
 
 export function loadConfig(options: LoadOptions = {}): WardenConfig {
   const dirs = options.dirs ?? defaultHostDirs();
   let config = applyUserOverrides(defaultConfig(), readJson(userConfigPath(dirs)));
-  if (options.cwd && options.projectTrusted) config = applyProjectOverrides(config, readJson(projectConfigPath(options.cwd, dirs)));
-  return config;
+  if (!options.cwd || !options.projectTrusted) return config;
+  const project = options.projectRaw ? options.projectRaw.value : readProjectConfig(options.cwd, dirs);
+  return applyProjectOverrides(config, project);
 }
 
 /** Reads only the user file, for editing and persisting consent. */

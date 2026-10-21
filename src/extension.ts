@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
-import { join, resolve as pathResolve } from "node:path";
+import { join, resolve as pathResolve, relative as pathRelative } from "node:path";
 import { homedir } from "node:os";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -22,13 +22,13 @@ import type { SteerKind, SteerSubject } from "./adaptive.js";
 import type { ToolCallRef } from "./action-guard.js";
 import { ArmingTracker, unparseableArmingRules } from "./arming.js";
 import * as configModule from "./config.js";
-import { applyUserOverrides, defaultConfig, getNestedValue, isMode, loadConfig, PACKAGE_NAME, parseConfigValue, PROJECT_CONFIG_FILE, projectConfigPath, readUserConfig, setNestedValue, setUserSetting, userConfigPath, writeUserConfig } from "./config.js";
+import { applyUserOverrides, defaultConfig, getNestedValue, isMode, loadConfig, loosenNotice, loosenedChecks, readLoosenRecord, readProjectConfig, writeLoosenRecord, PACKAGE_NAME, parseConfigValue, PROJECT_CONFIG_FILE, projectConfigPath, readUserConfig, setNestedValue, setUserSetting, userConfigPath, writeUserConfig } from "./config.js";
 import type { WardenConfig, WardenMode } from "./config.js";
 import { checkSkipReason, classifyToolResult, doneNudge, emptyEvidence, evaluateDone, finalAssistantText, formatDone, isVisualCheck, localUrl, needsDoneCheck, projectCheckCommand, recordOutcome as recordDoneOutcome, recordUi } from "./done.js";
 import type { RunEvidence } from "./done.js";
 import { causeNudge, causePreFilter, emptyCauseActivity, evaluateCause, formatCause, recordCauseActivity } from "./cause.js";
 import type { CauseActivity, CauseStore } from "./cause.js";
-import { createdScratch, describeAsked, evaluateAction, formatVerdictTokens, higher, inertPathRules, intentSteer, largeOutputNotice, movedInTargets, offTaskSteer, pruneScratch, scratchCandidates, SCRATCH_PATHS_ENV, scratchPaths, scoreFreeReason, shouldProceedMessage, SLOP_LABELS, SteerRepeatWindow, steerReason, stripDataText, unknownExemptIds, wardenHostPaths, writeSinkTargets, isVisibleCommand } from "./guard.js";
+import { CONFIG_HOLD_ID, configWriteTargets, createdScratch, describeAsked, evaluateAction, formatVerdictTokens, higher, inertPathRules, intentSteer, largeOutputNotice, movedInTargets, offTaskSteer, pruneScratch, scratchCandidates, SCRATCH_PATHS_ENV, scratchPaths, scoreFreeReason, shouldProceedMessage, SLOP_LABELS, SteerRepeatWindow, steerReason, stripDataText, unknownExemptIds, wardenHostPaths, writeSinkTargets, isVisibleCommand } from "./guard.js";
 import type { Level, PatternHit, PreviousAction, ScratchIdentity, SlopSymptom, TaskMessage, Verdict } from "./guard.js";
 import { commandOf } from "./tools.js";
 import { mergeWrites, shellWrites } from "./shell-writes.js";
@@ -447,6 +447,11 @@ export default function wardenExtension(host: ExtensionAPI): void {
   let sessionHostPaths: string[] = [];
   // Scratch roots the host declares; set per session from PI_WARDEN_SCRATCH_PATHS.
   let sessionScratchPaths: string[] = [];
+  /** The project file read once at session start: an edit to it lands at the next session, never mid-run. */
+  let sessionProject: { cwd: string; value: unknown } | undefined;
+  /** The config for a session: its project file comes from the snapshot taken when the session started. */
+  const sessionConfig = (cwd: string, trusted: boolean): WardenConfig =>
+    loadConfig({ cwd, projectTrusted: trusted, dirs, ...(sessionProject && sessionProject.cwd === cwd ? { projectRaw: sessionProject } : {}) });
   let panel: PanelController | undefined;
   let configPanel: PanelController | undefined;
   let lastUi: PanelUi | undefined;
@@ -683,7 +688,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
   // Config values that were not applied as written: said once per session; /warden status repeats them.
   let configWarningsReported = false;
   const configFor = (ctx: ExtensionContext | ExtensionCommandContext): WardenConfig => {
-    const { config, missing } = guardCurrentSections(completeConfig(loadConfig({ cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted(), dirs })));
+    const { config, missing } = guardCurrentSections(completeConfig(sessionConfig(ctx.cwd, ctx.isProjectTrusted())));
     if (missing.length && !shapeReported) {
       shapeReported = true;
       // A namespace read stays undefined (not a link error) when an older config module lacks the export.
@@ -1219,7 +1224,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
 
   // Record-only: neither calibration met the activation gate, so nothing claims the event or acts on the answers.
   pi.events?.on("pi-subagents/supervision-evaluate/v1", createSupervisionHandler({
-    config: () => guardCurrentSections(completeConfig(loadConfig({ cwd: sessionCwd, projectTrusted: sessionTrusted, dirs }))).config,
+    config: () => guardCurrentSections(completeConfig(sessionConfig(sessionCwd, sessionTrusted))).config,
     judge: config => judgeFor(config, true),
     quietSignal: signal => quietSignals.add(signal),
     record: (line, details) => { trace.push({ at: Date.now(), guard: "subagent", line, details }); },
@@ -1227,6 +1232,8 @@ export default function wardenExtension(host: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     sessionCwd = ctx.cwd;
     sessionTrusted = ctx.isProjectTrusted();
+    // Read the project file once for this session; the snapshot is what every guarded call reuses.
+    sessionProject = { cwd: ctx.cwd, value: readProjectConfig(ctx.cwd, dirs) };
     if (ctx.hasUI) lastUi = ctx.ui as unknown as PanelUi;
     noticeUi = ctx.hasUI ? ctx.ui : undefined;
     // Read the running build once per session: the shipped entry behind Pi's loader, not the source a checkout edits.
@@ -1353,6 +1360,18 @@ export default function wardenExtension(host: ExtensionAPI): void {
       if (ctx.hasUI) ctx.ui.notify(msg, "warning"); else pi.sendMessage({ customType: `${PACKAGE_NAME}-status`, content: msg, display: true });
     }
     const opening = configFor(ctx);
+    // One line, once per new loosened set: the project file can switch a check off, and this is where the owner hears it.
+    const loosened = loosenedChecks(loadConfig({ dirs }), opening);
+    if (loosened.length) {
+      const names = loosened.map(check => check.name);
+      const recorded = readLoosenRecord(ctx.cwd, dirs);
+      const seen = recorded !== undefined && recorded.length === names.length && names.every(name => recorded.includes(name));
+      if (!seen) {
+        const line = loosenNotice(loosened, dirs);
+        if (ctx.hasUI) ctx.ui.notify(line, "warning"); else pi.sendMessage({ customType: `${PACKAGE_NAME}-status`, content: line, display: true });
+        writeLoosenRecord(ctx.cwd, names, dirs);
+      }
+    }
     // ── Silent-half trial ──
     // The arm is fixed for the whole session from its id, so a resume or reload keeps it. With the setting off, no
     // record is written and no delivery changes; only the user's config file can turn it on.
@@ -2027,6 +2046,23 @@ export default function wardenExtension(host: ExtensionAPI): void {
       // Fix 6: armed hits on read-only commands still record a trace line (bypass the read-only source gate).
       if (verdict.source === "read-only") verdict.source = "pattern";
     }
+    // A write to pi-warden's own config can switch a check off, and Pi reports a project trusted when it ships none of
+    // Pi's own resources, so the project file is nearly always applied: the floor holds the write. `action.exemptRules`
+    // naming `warden-config-write` is how the operator silences it, as for any other built-in rule.
+    const configTargets = config.action.exemptRules.includes(CONFIG_HOLD_ID)
+      ? []
+      : configWriteTargets(event.toolName, event.input as Record<string, unknown>, ctx.cwd, dirs, shell);
+    // Name it the way the user sees it: inside this project, otherwise its absolute path.
+    const configNames = configTargets.map(path => {
+      const inside = pathRelative(ctx.cwd, path);
+      return inside && !inside.startsWith("..") ? inside : path;
+    });
+    if (configNames.length) {
+      verdict.patterns.push({ id: CONFIG_HOLD_ID, severity: "destructive", label: `writes pi-warden's own config ${configNames.join(", ")}` });
+      verdict.level = higher(verdict.level, "confirm");
+      verdict.reasons.push(`pi-warden's own config ${configNames.join(", ")}: a write here switches a check off`);
+      if (verdict.source === "read-only") verdict.source = "pattern";
+    }
     const deliveryVerdict = agentDeliveryVerdict(verdict);
     const deliveryReasons = deliveryVerdict.reasons;
     // The agent reads reasons without their scores; the trace, holds, and learning records keep them.
@@ -2214,6 +2250,14 @@ export default function wardenExtension(host: ExtensionAPI): void {
       if (sent) watchSteer(ctx, config, ["warn-headless"]);
       return sent;
     };
+    // Nobody can approve the hold without a UI, so a write to pi-warden's own config is blocked in every mode there.
+    if (configNames.length && verdict.level !== "deny" && !ctx.hasUI) {
+      deliverNotes(false);
+      stats.held++;
+      actionGuard.hold(task);
+      track(true);
+      return { block: true, reason: `pi-warden held this ${event.toolName} call: it writes pi-warden's own config (${configNames.join(", ")}), which can switch a check off. Nothing was written. Do not retry it: ask the user to change that file.` };
+    }
     if (verdict.level === "warn") {
       deliverNotes(true);
       stats.warned++;

@@ -12,9 +12,11 @@ import type { TaskSpine } from "./shape.js";
 import { askChunks, globToRegExp, questionLimit } from "./rules.js";
 import type { LimitedJudge, RulesSourceConfig } from "./rules.js";
 import { indexDir } from "./index-cmd.js";
+import { PROJECT_CONFIG_FILE, projectConfigPath, userConfigPath } from "./config.js";
 import type { HostDirs } from "./host-dirs.js";
 import { resolveRulesFile } from "./rules-file.js";
 import { mergeWrites, shellWrites } from "./shell-writes.js";
+import type { ShellWriteScan } from "./shell-writes.js";
 import { COMMAND_TOOLS, commandOf } from "./tools.js";
 import { actionAskGate } from "./ask-gate.js";
 import { commandIndex, scriptSources, shellCommands, shellParts, type ScriptSource, type ShellWord as CommandWord } from "./script-bodies.js";
@@ -2098,6 +2100,9 @@ export interface PatternOptions {
   platform?: NodeJS.Platform | undefined;
 }
 
+/** The id an exemption names: `action.exemptRules: ["warden-config-write"]`. */
+export const CONFIG_HOLD_ID = "warden-config-write";
+
 /** Every id exemptRules can legitimately name: the built-in shell rules, the rm-classifier's derived ids, and the
  * sensitive-path id. Unknown ids (a typo, or a rule that never existed) are inert; this list lets the surface be
  * reported once instead of discovered when the rule the user meant to silence keeps firing. */
@@ -2112,6 +2117,7 @@ export const EXEMPTABLE_IDS: readonly string[] = [
   "sql-hosted",
   "sql-hosted-write",
   "sensitive-path",
+  CONFIG_HOLD_ID,
 ];
 
 /** Built-in pattern IDs whose hits become evidence (not level-setters) in evidence mode.
@@ -2298,6 +2304,129 @@ export function writeSinkTargets(command: string): string[] {
     }
   }
   return targets;
+}
+
+/** The resolved form of a path: its real path, or the real path of its deepest existing ancestor plus the rest. */
+function resolvedTarget(path: string): string {
+  return realTarget(path) ?? resolve(path);
+}
+
+interface ConfigRoots { files: Set<string>; dirs: string[]; free: string[] }
+
+const underRoot = (target: string, root: string): boolean => target === root || target.startsWith(root.endsWith(sep) ? root : root + sep);
+
+/** pi-warden's own config as the OS resolves it: the project file, and the user's pi-warden directory. */
+function configRoots(cwd: string | undefined, dirs: HostDirs): ConfigRoots {
+  const files = new Set<string>();
+  if (cwd) files.add(resolvedTarget(projectConfigPath(cwd, dirs)));
+  // `/warden index` asks the session model to write the capability index, so that one folder inside the user directory
+  // stays free: it holds recommendations, never a check.
+  return { files, dirs: [resolvedTarget(dirname(userConfigPath(dirs)))], free: [resolvedTarget(indexDir(process.env, dirs))] };
+}
+
+/** A resolved path that is pi-warden's own config: the project file, any `pi-warden.json` in a `.pi` directory, or a
+ *  file in the user's pi-warden directory. */
+function isConfigTarget(target: string, roots: ConfigRoots, configDirName: string): boolean {
+  if (roots.files.has(target)) return true;
+  if (basename(target) === PROJECT_CONFIG_FILE) {
+    const parent = basename(dirname(target));
+    // A vendored or copied project file is the same file to whoever edits it, whatever project it sits in.
+    if (parent === configDirName || parent === ".pi") return true;
+  }
+  if (roots.free.some(root => underRoot(target, root))) return false;
+  return roots.dirs.some(root => underRoot(target, root));
+}
+
+/** A written path resolved as the shell and the OS read it: `~`, `$HOME`, a relative path, `..`, and a symlink. */
+function configCandidate(text: string, cwd: string): string | undefined {
+  const home = homedir();
+  let word = text.trim();
+  if (!word) return undefined;
+  for (const prefix of ["${HOME}", "$HOME"]) {
+    if (word === prefix || word.startsWith(`${prefix}/`)) { word = `${home}${word.slice(prefix.length)}`; break; }
+  }
+  if (word === "~") word = home;
+  else if (word.startsWith("~/")) word = join(home, word.slice(2));
+  // A variable this reader cannot expand could name anything; the session snapshot covers what this misses.
+  if (word.includes("$")) return undefined;
+  return resolvedTarget(isAbsolute(word) ? word : resolve(cwd, word));
+}
+
+const COPY_HEADS = new Set(["cp", "mv", "ln", "install", "rsync"]);
+const IN_PLACE_HEADS = new Set(["sed", "gsed", "perl"]);
+
+/**
+ * Every path a shell command writes, from the shapes the floor already reads (redirects, `tee`, heredocs, the script it
+ * runs) plus the destination of `cp`/`mv`/`ln`/`install`/`rsync` and the file an in-place editor rewrites. What a program
+ * writes (`node -e`, a script fed to an interpreter) is not in the command text and is not read here; neither is a
+ * destination named by a variable.
+ */
+function commandWriteTargets(command: string, cwd: string | undefined, depth: number, scan?: ShellWriteScan): string[] {
+  const targets: string[] = [];
+  const writes = scan ?? shellWrites(command, { home: homedir() });
+  for (const write of writes.writes) targets.push(write.path);
+  // A skipped write still names its target (`sed -i`, a pipe into tee): the path is known even when the text is not.
+  for (const skip of writes.skips) if (skip.path) targets.push(skip.path);
+  const code = stripShellComments(command);
+  const text = stripDataText(code).text;
+  targets.push(...writeSinkTargets(text));
+  for (const segment of splitShell(text)) {
+    const head = (headOf(segment) ?? "").replace(/^.*\//, "");
+    if (!head) continue;
+    const words = segment.trim().split(/\s+/).slice(1);
+    const operands = words.filter(word => !word.startsWith("-"));
+    if (COPY_HEADS.has(head)) {
+      const at = words.findIndex(word => word === "-t" || word === "--target-directory");
+      const named = at >= 0 ? words[at + 1] : undefined;
+      const inline = words.find(word => word.startsWith("--target-directory="));
+      const directory = named ?? inline?.slice("--target-directory=".length);
+      // `cp a b` writes b; with one operand (or a directory named by -t) nothing here is a destination.
+      if (directory) targets.push(unquoteWord(directory));
+      else if (operands.length >= 2) targets.push(unquoteWord(operands.at(-1)!));
+      continue;
+    }
+    if (IN_PLACE_HEADS.has(head)) {
+      if (words.some(word => /^-[A-Za-z]*i/.test(word) || word.startsWith("--in-place"))) for (const operand of operands) targets.push(unquoteWord(operand));
+      continue;
+    }
+    if (head === "dd") { for (const word of words) if (word.startsWith("of=")) targets.push(unquoteWord(word.slice(3))); continue; }
+    if (head === "truncate" || head === "touch") for (const operand of operands) targets.push(unquoteWord(operand));
+  }
+  // A script the command runs writes through the same shapes; its body is read once, one level deep.
+  if (cwd && depth > 0) {
+    for (const source of scriptSources(code, cwd)) {
+      if (source.kind !== "shell") continue;
+      targets.push(...commandWriteTargets(source.body, cwd, depth - 1));
+    }
+  }
+  return targets;
+}
+
+/**
+ * The paths a call writes that are pi-warden's own config, in the order the call writes them. A read is not a write:
+ * `cat .pi/pi-warden.json` and `cp .pi/pi-warden.json /tmp` stay free. `scan` is the shell reader the caller already ran
+ * for this command, so a command is not parsed twice.
+ */
+export function configWriteTargets(
+  tool: string,
+  input: Record<string, unknown>,
+  cwd: string,
+  dirs: HostDirs,
+  scan?: ShellWriteScan,
+): string[] {
+  const view = commandOf(tool, input);
+  // Only a file tool that writes has a path side; `read` on the same path is the agent reading its own config.
+  const path = isWriteTool(tool) && typeof input.path === "string" ? input.path : undefined;
+  const candidates = view?.command ? commandWriteTargets(view.command, cwd, 1, scan) : path ? [path] : [];
+  if (!candidates.length) return [];
+  const roots = configRoots(cwd, dirs);
+  const held: string[] = [];
+  for (const candidate of candidates) {
+    const target = configCandidate(candidate, cwd);
+    if (!target || held.includes(target) || !isConfigTarget(target, roots, dirs.configDirName)) continue;
+    held.push(target);
+  }
+  return held;
 }
 
 /** Shared glob/regex path matcher used by both path rules (guard.ts) and arming rules (arming.ts).

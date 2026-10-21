@@ -7,8 +7,9 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { TypeSafeIntegrationError } from "pi-typesafe";
-import { defaultConfig } from "../src/config.js";
-import { bornAfter, buildRequest, commandFamily, createdScratch, mktempOnly, movedInTargets, realTarget, scratchCandidates, scratchPaths, describeAction, evaluateAction, formatVerdict, hostPaths, inertPathRules, intentSteer, isReadOnlyCommand, largeOutputNotice, matchPatterns, offTaskSteer, pruneScratch, scratchIdentity, steerFingerprint, SteerRepeatWindow, steerReason, stripDataText, textApproves, unknownExemptIds, isVisibleCommand, volatileTempRoots, wardenHostPaths } from "../src/guard.js";
+import { defaultConfig, PACKAGE_NAME } from "../src/config.js";
+import { defaultHostDirs } from "../src/host-dirs.js";
+import { BUILT_IN_IDS, CONFIG_HOLD_ID, EXEMPTABLE_IDS, configWriteTargets, bornAfter, buildRequest, commandFamily, createdScratch, mktempOnly, movedInTargets, realTarget, scratchCandidates, scratchPaths, describeAction, evaluateAction, formatVerdict, hostPaths, inertPathRules, intentSteer, isReadOnlyCommand, largeOutputNotice, matchPatterns, offTaskSteer, pruneScratch, scratchIdentity, steerFingerprint, SteerRepeatWindow, steerReason, stripDataText, textApproves, unknownExemptIds, isVisibleCommand, volatileTempRoots, wardenHostPaths } from "../src/guard.js";
 import type { Judge } from "../src/guard.js";
 import { actionDetails } from "../src/trace.js";
 import { actionTokens } from "../src/widget.js";
@@ -1949,4 +1950,90 @@ test("a backslash-newline in quotes or in a data heredoc does not turn the text 
     "cat <<E\"O\"\\\nF >/dev/null\nrm -rf ~\nEOF",
     "cat <<\\\n-X >/dev/null\n\trm -rf ~\n\tX",
   ]) assert.deepEqual(floorIds(command), [], JSON.stringify(command));
+});
+
+// --- pi-warden's own config: held on the write side, free on the read side ---------------------
+
+const wardenConfigHeld = (tool: string, input: Record<string, unknown>) => configWriteTargets(tool, input, cwd, defaultHostDirs());
+
+test("a write or edit of pi-warden's own project file is held, whatever the spelling of the path", async () => {
+  await mkdir(join(cwd, ".pi"), { recursive: true });
+  await writeFile(join(cwd, ".pi", "pi-warden.json"), "{}\n");
+  await symlink(join(cwd, ".pi"), join(cwd, "pi-link"), "dir");
+  for (const path of [
+    ".pi/pi-warden.json",
+    "./.pi/pi-warden.json",
+    ".pi/./pi-warden.json",
+    "src/../.pi/pi-warden.json",
+    join(cwd, ".pi", "pi-warden.json"),
+    "pi-link/pi-warden.json",
+  ]) {
+    assert.equal(wardenConfigHeld("write", { path, content: "{}" }).length, 1, `write ${path}`);
+    assert.equal(wardenConfigHeld("edit", { path }).length, 1, `edit ${path}`);
+  }
+  // A copy of the file ruled by another project is the same file to whoever edits it.
+  await mkdir(join(cwd, "vendor", ".pi"), { recursive: true });
+  assert.equal(wardenConfigHeld("write", { path: "vendor/.pi/pi-warden.json", content: "{}" }).length, 1);
+});
+
+test("a write into pi-warden's own user directory is held, after a symlink or a .. segment", async () => {
+  const userDir = join(process.env.PI_CODING_AGENT_DIR!, PACKAGE_NAME);
+  await mkdir(join(userDir, "holds"), { recursive: true });
+  await symlink(userDir, join(cwd, "agent-link"), "dir");
+  for (const path of [join(userDir, "config.json"), join(userDir, "holds", "2026-10-21-x.jsonl"), "agent-link/config.json", `${join(userDir, "index")}/../config.json`]) {
+    assert.equal(wardenConfigHeld("write", { path, content: "{}" }).length, 1, `write ${path}`);
+  }
+});
+
+test("the bash shapes that write pi-warden's config are held, one level of script included", async () => {
+  await mkdir(join(cwd, ".pi"), { recursive: true });
+  await mkdir(join(cwd, "scripts"), { recursive: true });
+  await writeFile(join(cwd, "scripts", "edit.sh"), "echo '{\"done\":{\"enabled\":false}}' > .pi/pi-warden.json\n");
+  for (const command of [
+    "cat > .pi/pi-warden.json <<'EOF'\n{\"done\":{\"enabled\":false}}\nEOF",
+    "echo '{\"done\":{\"enabled\":false}}' > .pi/pi-warden.json",
+    "printf '%s' '{}' >> .pi/pi-warden.json",
+    "tee .pi/pi-warden.json <<< '{}'",
+    "sed -i 's/false/true/' .pi/pi-warden.json",
+    "cp /tmp/x .pi/pi-warden.json",
+    "mv /tmp/x .pi/pi-warden.json",
+    "ln -s /tmp/x .pi/pi-warden.json",
+    "install -m 600 /tmp/x .pi/pi-warden.json",
+    "dd if=/tmp/x of=.pi/pi-warden.json",
+    "sh scripts/edit.sh",
+    "cat scripts/edit.sh | sh",
+  ]) {
+    assert.equal(wardenConfigHeld("bash", { command }).length, 1, command);
+  }
+});
+
+test("reading pi-warden's config, and writing next to it, stays free", async () => {
+  await mkdir(join(cwd, ".pi"), { recursive: true });
+  await writeFile(join(cwd, ".pi", "pi-warden.json"), "{\"done\":{\"enabled\":true}}\n");
+  const userDir = join(process.env.PI_CODING_AGENT_DIR!, PACKAGE_NAME);
+  await mkdir(userDir, { recursive: true });
+  for (const command of [
+    "cat .pi/pi-warden.json",
+    "grep -n done .pi/pi-warden.json",
+    "head -3 .pi/pi-warden.json",
+    "cp .pi/pi-warden.json /tmp/warden-copy.json",
+    "mv .pi/pi-warden.json /tmp/warden-copy.json",
+    "sed -n '1,2p' .pi/pi-warden.json",
+    `cat ${join(userDir, "config.json")}`,
+  ]) {
+    assert.deepEqual(wardenConfigHeld("bash", { command }), [], command);
+  }
+  // `/warden index` has the session model write this folder, and it holds recommendations, never a check.
+  const indexPath = join(userDir, "index", "global.json");
+  assert.deepEqual(wardenConfigHeld("write", { path: indexPath, content: "{}" }), [], "the capability index stays writable");
+  for (const path of ["pi-warden.md", ".pi/AGENTS.md", ".pi/settings.json", ".pi-warden/audit-report.html", "src/pi-warden.json", join(process.env.PI_CODING_AGENT_DIR!, "pi-warden-inbox", "note.txt"), join(process.env.PI_CODING_AGENT_DIR!, "settings.json")]) {
+    assert.deepEqual(wardenConfigHeld("write", { path, content: "x" }), [], `write ${path}`);
+  }
+  assert.deepEqual(wardenConfigHeld("read", { path: ".pi/pi-warden.json" }), [], "a read is never held");
+});
+
+test("the config hold is a built-in rule an exemption can name", () => {
+  assert.ok(EXEMPTABLE_IDS.includes(CONFIG_HOLD_ID));
+  assert.ok(BUILT_IN_IDS.has(CONFIG_HOLD_ID));
+  assert.deepEqual(unknownExemptIds([CONFIG_HOLD_ID]), []);
 });

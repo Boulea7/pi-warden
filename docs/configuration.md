@@ -216,6 +216,22 @@ After building, `/warden index` reports which skill and tool descriptions would 
 
 A project may add `.pi/pi-warden.json` with `enabled` and per-guard overrides: thresholds, extra guarded tools, `rules.files`, `rules.skip`, `rules.sensitivePaths`, or `"done": { "enabled": false }`. Project files are read only when Pi trusts the project. They can never grant `typesafe` consent, change `typesafeBackend` or `mode`, raise `timeoutMs` or `maxRequests`, set `notify.command`, turn relevance compaction on or off (`compaction.enabled`), turn the context filter on or off (`context.filter.enabled`), turn `security.maskOutput` off, or name a `security.shareLinkParams` entry. The `widget`, `steers`, `learning`, `conscience`, `steerVisible`, `notices`, `steerBudget`, and `trial` keys, and the user-declared rule lists and `action.floor` of the action guard, are read from the user file only. A key a project file cannot set at all is ignored without a warning.
 
+### When the project file is read
+
+A session reads the project file **once, when it starts**, and uses that snapshot for every call of the session. A project file edited during a session — by the agent or by you — applies from the next session: Pi starts one for `/new`, `/resume` (including a resume of the same session), `/fork`, and a reload. The user file has no snapshot: it is read again on every call, so a change to it applies at once. The record of the last loosened set is per project, in `<agent dir>/pi-warden/project-config/<sha256(project path).slice(0,12)>.json` beside the user config, and an unreadable or missing record only means the line shows (below).
+
+### The loosening notice
+
+At session start, when the project file takes away a check compared with your own config, one line names each of them, for example `This project's .pi/pi-warden.json switches off: done-check.` It shows only when the set differs from the set last recorded for this project, and never when the file takes nothing away. The comparisons are:
+
+- a guard switched off: `done.enabled`, `done.nudge`, `done.uiProof`, `cause.enabled`, `cause.nudge`, `stuck.enabled`, `stuck.nudge`, `stuck.repeatSteer`, `slop.enabled`, `rules.enabled`, `runaway.enabled`, `subagent.enabled`;
+- a threshold raised, so fewer calls are checked: `done.claimsDone`, `cause.claimsCause`, `slop.threshold`, `rules.threshold`, `rules.softThreshold`, `stuck.sameStrategy`, `action.irreversible.warn`, `action.irreversible.confirm`, `action.offTask.warn`, `action.offTask.steer`, `security.threshold`, `judge.cooldownMs`;
+- a list changed so a check reaches less: an entry added to `rules.exclude` or `rules.skip`, or an entry dropped from `rules.files` or `done.uiFiles`.
+
+The action guard and security cannot be weakened from a project file (the loader refuses those values, with a config warning), so they never appear in the line. Nothing here is a prompt: the line is shown, never asked.
+
+**Agents cannot write pi-warden's own config.** A `write`, `edit`, or `bash` call that writes `.pi/pi-warden.json` or a file in `<agent dir>/pi-warden/` is held by a built-in floor rule, so a cloned repository cannot switch a check off by having the agent edit its own config. The capability index under `<agent dir>/pi-warden/index/`, which `/warden index` asks the session model to write, stays writable. See [guards.md](guards.md#pi-wardens-own-config).
+
 A project file may make the action guard and security stricter, never weaker. These keys take the project value only when it is at least as strict as the user's value (from the user file, or the default):
 
 | Key | Taken from a project file | Ignored |

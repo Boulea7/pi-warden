@@ -376,6 +376,37 @@ New config key `action.armingRules` (user file only):
 
 ---
 
+## The config hold: `warden-config-write`
+
+The fourth built-in rule, and the first one that holds a path rather than a command. Pi 1.3.0
+reports a project trusted, without reading a trust record, when the project ships none of Pi's
+own resources (`dist/core/project-trust.js:22`, the list at `dist/core/trust-manager.js:8-17`),
+so `loadConfig` applies `.pi/pi-warden.json` in nearly every project, and a measured drive showed
+that `{"done":{"enabled":false}}` there removes the done-check — also when the file is written
+mid-session, because the config was re-read on every call. An agent that can write that file can
+switch off the checks it is being judged by. The rule holds the write; the session snapshot
+(`docs/configuration.md`) makes any shape the rule misses harmless for the current run.
+
+- **What it holds.** A `write` or `edit` of `.pi/pi-warden.json`, of any `pi-warden.json` inside
+  a `.pi` directory, or of a file in `<agent dir>/pi-warden/` other than `<agent dir>/pi-warden/index/`
+  (the capability index, which `/warden index` asks the session model to write). A `bash` call that
+  writes one, read through the floor's existing reader (`src/shell-writes.ts`) plus the destination
+  of `cp`/`mv`/`ln`/`install`/`rsync`, the file of `sed -i`/`perl -i`, `dd of=`, `truncate`, and the
+  body of a script the command runs, one level deep.
+- **Path resolution.** `~`, `$HOME`, relative paths against the call's directory, `..`, and symlinks,
+  both sides through `realTarget`, so another spelling of the same file is the same file.
+- **The read side stays free.** `read`, `cat`, `grep`, and `cp`/`mv` *from* the config are not
+  writes. So are `pi-warden.md` (the project rules file, which `/warden improve` asks the model to
+  edit) and every other file under `.pi/`.
+- **Why it is not `deny`.** A `deny` hit blocks with no dialog, and the owner editing their own
+  config through the agent is legitimate. The hit is `destructive`, so the existing ladder decides:
+  a dialog in `confirm` mode, a steer hold in `steer` mode, a warning in `advise` mode, and with no
+  UI a block in every mode.
+- **Exemption.** `action.exemptRules: ["warden-config-write"]`, the same hatch every built-in id has.
+- **What it does not read.** A program's own write (`node -e`, a heredoc fed to an interpreter), and a
+  destination named by a variable. Both stay under the session snapshot, which is the backstop this
+  rule is designed with rather than an afterthought.
+
 ## Threat model
 
 Two new surfaces deserve explicit attention:

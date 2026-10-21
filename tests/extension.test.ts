@@ -11,7 +11,7 @@ import { createTypeSafe } from "pi-typesafe";
 import type { Extension, ExtensionContext, RegisteredCommand } from "@earendil-works/pi-coding-agent";
 import { initSchema, queryHoldsForProject, recordCause } from "../src/learning.js";
 import { readRulesLog, rulesLogPath } from "../src/rules-log.js";
-import { defaultConfig, loadConfig } from "../src/config.js";
+import { defaultConfig, loadConfig, loosenRecordPath } from "../src/config.js";
 import { policyMatches, CONSCIENCE_BETA_POLICY } from "../src/load.js";
 import { _testSetIndexRunning, askedBeforeReply, assistantPlan } from "../src/extension.js";
 import { SHELL_RULES_CHECKS } from "../src/turn-rules.js";
@@ -2014,6 +2014,11 @@ test("rules: a write in a project with pi-warden.md gets its own request beside 
   const readme = join(temporary, "README.md");
   try {
     await writeFile(rulesFile, "# No console statements\nCode must not contain `console.log`.\n\n# Tests for exports\npaths: src/**\nEvery exported function needs a test.\n");
+    // A session reads its project file once, when it starts, so this one is written before the session's judged calls.
+    await mkdir(join(temporary, ".pi"), { recursive: true });
+    await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ rules: { exclude: ["secrets/**"], sensitivePaths: { "migrations/**": "Tell the user this touches a migration" } } }));
+    await sessionStart();
+    requests.length = 0;
     nextAnswers = { irreversible: 0.05, off_task: 0.05, scope: "expected_step", slop_stub: 0.92, slop_hedging: 0.1, slop_comments: 0.1, slop_dead: 0.1, "rule_no-console-statements": "violation" };
     assert.equal(await toolCall("write", { path: join(temporary, "src", "r.ts"), content: "export const r = () => { console.log(1); return null; };" }), undefined);
     assert.equal(requests.length, 2, "action request plus rules request");
@@ -2040,8 +2045,6 @@ test("rules: a write in a project with pi-warden.md gets its own request beside 
     requests.length = 0;
     await toolCall("write", { path: join(temporary, "docs", "guide.md"), content: "console.log in prose" });
     assert.deepEqual(Object.keys(requests.find(request => "rule_no-console-statements" in request.questions)!.questions), ["rule_no-console-statements"]);
-    await mkdir(join(temporary, ".pi"), { recursive: true });
-    await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ rules: { exclude: ["secrets/**"], sensitivePaths: { "migrations/**": "Tell the user this touches a migration" } } }));
     requests.length = 0;
     await toolCall("write", { path: join(temporary, "secrets", "keys.ts"), content: "export const k = 1;" });
     assert.equal(requests.filter(request => Object.keys(request.questions).some(key => key.startsWith("rule_"))).length, 0, "excluded path: no rules request");
@@ -2068,6 +2071,7 @@ test("rules: a write in a project with pi-warden.md gets its own request beside 
     assert.match(String(aggregate.state.rules), /Never commit console\.log/);
     assert.match(sentMessages.at(-1)!.message.content, /breaks a project rule: "the project's README\.md" \(0\.80\)/);
     await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ rules: { fallback: false } }));
+    await sessionStart();
     requests.length = 0;
     await toolCall("write", { path: join(temporary, "src", "g.ts"), content: "console.log(3)" });
     assert.equal(requests.filter(request => "rules" in request.questions).length, 0);
@@ -2078,6 +2082,7 @@ test("rules: a write in a project with pi-warden.md gets its own request beside 
     // the writes above spent this run's three notices.
     await rm(configPath(), { force: true });
     await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ rules: { sensitivePaths: { "**/permissions*": "Ask for a security review" } } }));
+    await sessionStart();
     await newPrompt("add the permissions helper");
     requests.length = 0; networkCalls = 0;
     await toolCall("write", { path: join(temporary, "src", "auth", "permissions.ts"), content: "export const can = () => true;" });
@@ -2711,6 +2716,8 @@ test("a trusted project file can tune thresholds but an untrusted one is ignored
   await grantConsent();
   await mkdir(join(temporary, ".pi"), { recursive: true });
   await writeFile(join(temporary, ".pi", "pi-warden.json"), JSON.stringify({ action: { irreversible: { warn: 0.1, confirm: 0.2 } } }));
+  // A session reads its project file once, when it starts; this file is written before that read.
+  await sessionStart();
   try {
     nextAnswers = { irreversible: 0.3, off_task: 0.1, scope: "expected_step" };
     assert.equal((await toolCall("bash", { command: "npm test" }))?.block, true, "project thresholds apply when trusted");
@@ -6201,4 +6208,84 @@ test("cause-check: a repeated unchecked cause is steered harder with the earlier
   await agentEnd("The alert is probably still from a manual edit.");
   assert.equal(sentMessages.length, 1);
   assert.match(sentMessages[0]!.message.content, new RegExp(new Date(at).toISOString().slice(0, 10)));
+});
+
+// --- pi-warden's own config: the write is held, the file is read once per session, a loosened set shows once ---
+
+const projectConfig = () => join(temporary, ".pi", "pi-warden.json");
+const clearProjectConfig = async () => { await rm(projectConfig(), { force: true }); await rm(loosenRecordPath(temporary), { force: true }); };
+
+test("a write to pi-warden's own config is held with no UI, and reading it or writing the rules file still runs", async () => {
+  await writeConfig(JSON.stringify({ notices: true, rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const headless = context({ hasUI: false });
+  const heredoc = await toolCall("bash", { command: "cat > .pi/pi-warden.json <<'EOF'\n{\"done\":{\"enabled\":false}}\nEOF" }, headless);
+  assert.equal(heredoc?.block, true, "the heredoc is held");
+  assert.match(heredoc!.reason!, /pi-warden's own config/);
+  assert.match(heredoc!.reason!, /\.pi\/pi-warden\.json/);
+  assert.equal(existsSync(projectConfig()), false, "nothing was written");
+  const direct = await toolCall("write", { path: projectConfig(), content: "{}" }, headless);
+  assert.equal(direct?.block, true, "the write tool is held");
+  const userFile = await toolCall("edit", { path: join(process.env.PI_CODING_AGENT_DIR!, "pi-warden", "config.json") }, headless);
+  assert.equal(userFile?.block, true, "pi-warden's own user config is held too");
+  assert.equal(await toolCall("bash", { command: "cat .pi/pi-warden.json" }, headless), undefined, "a read is free");
+  assert.equal(await toolCall("write", { path: join(temporary, "pi-warden.md"), content: "# rules\n" }, headless), undefined, "the rules file is free");
+  assert.equal(await toolCall("write", { path: join(temporary, ".pi", "settings.json"), content: "{}" }, headless), undefined, "another .pi file is free");
+  await clearProjectConfig();
+});
+
+test("with a UI, confirm mode asks the user before a write to pi-warden's own config", async () => {
+  await writeConfig(JSON.stringify({ mode: "confirm", rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  confirmResult = false;
+  const refused = await toolCall("write", { path: projectConfig(), content: "{}" });
+  assert.equal(refused?.block, true);
+  assert.match(confirms.at(-1)?.title ?? "", /allow this write call/);
+  assert.equal(existsSync(projectConfig()), false, "a no leaves the file alone");
+  confirmResult = true;
+  assert.equal(await toolCall("write", { path: projectConfig(), content: "{}" }), undefined, "a yes runs the call");
+  await clearProjectConfig();
+});
+
+test("the project file is read once per session: a mid-run edit lands at the next session", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  await runCommand("status");
+  assert.match(notices.at(-1)!.text, /done-check/, "the done-check is on");
+  await writeFile(projectConfig(), JSON.stringify({ done: { enabled: false } }));
+  await runCommand("status");
+  assert.match(notices.at(-1)!.text, /done-check/, "a mid-run edit does not change this session");
+  await sessionStart();
+  await runCommand("status");
+  assert.doesNotMatch(notices.at(-1)!.text, /done-check/, "the next session reads the file");
+  await clearProjectConfig();
+});
+
+test("a loosened project file shows one line at session start, once for that set", async () => {
+  await writeConfig(JSON.stringify({ rules: { enabled: false } }));
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await clearProjectConfig();
+  await sessionStart();
+  const lines = () => notices.filter(notice => notice.text.startsWith("This project's"));
+  assert.deepEqual(lines(), [], "nothing loosened, no line");
+  await writeFile(projectConfig(), JSON.stringify({ done: { enabled: false } }));
+  notices.length = 0;
+  await sessionStart();
+  assert.equal(lines().length, 1);
+  assert.match(lines()[0]!.text, /switches off: done-check\./);
+  notices.length = 0;
+  await sessionStart();
+  assert.deepEqual(lines(), [], "the same set stays quiet");
+  await writeFile(projectConfig(), JSON.stringify({ done: { enabled: false }, cause: { enabled: false } }));
+  notices.length = 0;
+  await sessionStart();
+  assert.equal(lines().length, 1);
+  assert.match(lines()[0]!.text, /switches off: done-check, cause-check\./);
+  await clearProjectConfig();
 });
