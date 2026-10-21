@@ -373,8 +373,12 @@ const toolCall = (toolName: string, input: Record<string, unknown>, ctx = contex
 };
 const sessionStart = (ctx = context()) => fire("session_start", {}, ctx);
 const configPath = () => join(temporary, "agent", "pi-warden", "config.json");
-/** Consent with the ask gate and the trace sample off, so a bash call always reaches the judge. */
-const writeConfig = (over: Record<string, unknown> = {}) => writeFile(configPath(), JSON.stringify({ typesafe: true, notices: false, rules: { enabled: false }, cause: { enabled: false }, slop: { enabled: false }, security: { enabled: false }, ...over, action: { ask: { enabled: false }, traceSample: 0, ...(over.action as Record<string, unknown> ?? {}) } }));
+/** Consent with the ask gate and the trace sample off, so a bash call always reaches the judge. Then start the
+ *  session that reads it: a config edit lands at the next session, so a test that writes one starts a session. */
+const writeConfig = async (over: Record<string, unknown> = {}) => {
+  await writeFile(configPath(), JSON.stringify({ typesafe: true, notices: false, rules: { enabled: false }, cause: { enabled: false }, slop: { enabled: false }, security: { enabled: false }, ...over, action: { ask: { enabled: false }, traceSample: 0, ...(over.action as Record<string, unknown> ?? {}) } }));
+  await sessionStart();
+};
 
 const savedKey = process.env.TYPESAFE_API_KEY;
 const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -457,7 +461,6 @@ test("a headless warn steer keeps the words and drops the score", async () => {
 
 test("a declined call's reason keeps the words and drops the score", async () => {
   await writeConfig({ mode: "confirm" });
-  await sessionStart();
   nextAnswers = { irreversible: 0.95, off_task: 0.1, scope: "expected_step", mutates: 0.9 };
   confirmResult = false;
   const declined = await toolCall("bash", { command: "npm run db:reset" });
