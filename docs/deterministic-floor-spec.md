@@ -384,8 +384,8 @@ own resources (`dist/core/project-trust.js:22`, the list at `dist/core/trust-man
 so `loadConfig` applies `.pi/pi-warden.json` in nearly every project, and a measured drive showed
 that `{"done":{"enabled":false}}` there removes the done-check — also when the file is written
 mid-session, because the config was re-read on every call. An agent that can write that file can
-switch off the checks it is being judged by. The rule holds the write; the session snapshot
-(`docs/configuration.md`) makes any shape the rule misses harmless for the current run.
+switch off the checks it is being judged by. The rule holds the write; the session snapshot of both
+config files (`docs/configuration.md`) makes any shape the rule misses harmless for the current run.
 
 - **What it holds.** A `write` or `edit` of `.pi/pi-warden.json`, of any `pi-warden.json` inside
   a `.pi` directory, or of a file in `<agent dir>/pi-warden/` other than `<agent dir>/pi-warden/index/`
@@ -401,12 +401,14 @@ switch off the checks it is being judged by. The rule holds the write; the sessi
   `cp /tmp/pi-warden.json .pi/` and a recursive copy of a `.pi` are held).
 - **Path resolution.** `~`, `$HOME`, relative paths against the directory the write runs in, `..`,
   and symlinks, both sides through `realTarget`, so another spelling of the same file is the same
-  file. After a `cd` the reader cannot resolve (a variable, `cd -`), a relative write whose file name
-  is `pi-warden.json` is held by that name.
-- **Scratch projects.** A `pi-warden.json` in a `.pi` directory of a project directly under the temp
-  directory stays free: tests and drives build scratch projects there. A session started in such a
-  project has its own file in `roots.files`, so that file is held, and the session gets the notice
-  line.
+  file. Every path and file name compare is made case-folded and in one Unicode form by `foldPath`
+  (`src/guard.ts`), because APFS treats `.pi/PI-WARDEN.JSON` and `.pi/pi-warden.json` as one file
+  and realpath keeps the typed case (measured 21 Oct 2026). After a `cd` the reader cannot resolve
+  (a variable, `cd -`), a relative write whose file name is `pi-warden.json` is held by that name.
+- **Scratch projects.** A `pi-warden.json` in a `.pi` directory at any depth under a temp root stays
+  free: tests and drives build scratch projects there, and a drive may nest one. A session started
+  in such a project has its own file in `roots.files`, checked first and folded the same way, so
+  that file is held and the session gets the notice line.
 - **The read side stays free.** `read`, `cat`, `grep`, and `cp`/`mv` *from* the config are not
   writes. So are `pi-warden.md` (the project rules file, which `/warden improve` asks the model to
   edit) and every other file under `.pi/`. A `mv` *of* the config is not a read: it removes a check
@@ -418,9 +420,10 @@ switch off the checks it is being judged by. The rule holds the write; the sessi
 - **Exemption.** `action.exemptRules: ["warden-config-write"]`, the same hatch every built-in id has.
 - **What it does not read.** A program's own write (`node -e`, a heredoc fed to an interpreter),
   `git apply` and `patch`, an editor, a destination named by a variable, and a write to another file
-  name after a `cd` it cannot resolve. The project file's shapes stay under the session snapshot,
-  which is the backstop this rule is designed with rather than an afterthought; the user file has no
-  snapshot, so the hold is its only guard.
+  name after a `cd` it cannot resolve. Both config files stay under the session snapshot, which is
+  the backstop this rule is designed with rather than an afterthought: a shape the hold misses
+  changes nothing in the running session, and one line says the file changed and applies at the
+  next session.
 
 ## Threat model
 

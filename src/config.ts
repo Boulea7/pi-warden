@@ -1323,6 +1323,13 @@ export interface LoadOptions {
    * mid-run edit lands at the next session. Omitted, the file is read on every call, as a library caller expects.
    */
   projectRaw?: { value: unknown } | undefined;
+  /** The user file, read once at session start the same way: an outside edit lands at the next session. */
+  userRaw?: { value: unknown } | undefined;
+}
+
+/** The user file's content, read without applying anything: the session snapshot is taken from here. */
+export function readUserConfigFile(dirs: HostDirs = defaultHostDirs()): unknown {
+  return readJson(userConfigPath(dirs));
 }
 
 /** The project file's content, read without applying anything: the session snapshot is taken from here. */
@@ -1391,7 +1398,7 @@ export const PROJECT_KEYS: Readonly<Record<string, ProjectKeyClass>> = {
   "cause.enabled": { kind: "off", check: "cause-check" },
   "cause.claimsCause": { kind: "high", check: "cause-check", label: "claims-cause threshold" },
   "cause.nudge": { kind: "off", check: "cause-check", label: "nudge" },
-  "cause.windowDays": { kind: "high", check: "cause-check", label: "window days" },
+  "cause.windowDays": { kind: "low", check: "cause-check", label: "window days" },
 
   "slop.enabled": { kind: "off", check: "slop-check" },
   "slop.threshold": { kind: "high", check: "slop-check", label: "threshold" },
@@ -1431,7 +1438,7 @@ export const PROJECT_KEYS: Readonly<Record<string, ProjectKeyClass>> = {
   "action.offTask.steer": { kind: "high", check: "off-task steer", label: "steer threshold" },
   "action.intentMismatch": { kind: "high", check: "intent-mismatch steer", label: "threshold" },
   "action.visibleMismatch": { kind: "high", check: "intent-mismatch steer", label: "visible-action threshold" },
-  "action.intentTraceOnly": { kind: "scale", check: "intent-mismatch steer", label: "trace-only mode", order: ["none", "invisible", "all"] },
+  "action.intentTraceOnly": { kind: "scale", check: "intent-mismatch steer", label: "trace-only mode", order: ["all", "invisible", "none"] },
   "action.shouldProceed.threshold": { kind: "high", check: "should-proceed steer", label: "threshold" },
   "action.shouldProceed.steer": { kind: "off", check: "should-proceed steer" },
   "action.feedbackLog": { kind: "none", why: "the hold record, not a check" },
@@ -1471,7 +1478,7 @@ export const PROJECT_KEYS: Readonly<Record<string, ProjectKeyClass>> = {
   "notify.command": { kind: "none", why: "user file only: a project never names a command" },
 
   "judge.cooldownMs": { kind: "high", check: "judge", label: "cooldown" },
-  "judge.failuresBeforeCooldown": { kind: "none", why: "how a failing backend is cooled down" },
+  "judge.failuresBeforeCooldown": { kind: "low", check: "judge", label: "failures before cooldown" },
 
   "subagent.enabled": { kind: "off", check: "subagent triage" },
   "subagent.wake": { kind: "off", check: "subagent wake" },
@@ -1585,7 +1592,7 @@ export function writeLoosenRecord(cwd: string, checks: readonly LoosenedCheck[],
 
 export function loadConfig(options: LoadOptions = {}): WardenConfig {
   const dirs = options.dirs ?? defaultHostDirs();
-  let config = applyUserOverrides(defaultConfig(), readJson(userConfigPath(dirs)));
+  let config = applyUserOverrides(defaultConfig(), options.userRaw ? options.userRaw.value : readJson(userConfigPath(dirs)));
   if (!options.cwd || !options.projectTrusted) return config;
   const project = options.projectRaw ? options.projectRaw.value : readProjectConfig(options.cwd, dirs);
   return applyProjectOverrides(config, project);

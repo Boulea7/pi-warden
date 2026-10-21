@@ -2313,12 +2313,25 @@ function resolvedTarget(path: string): string {
 
 interface ConfigRoots { files: Set<string>; dirs: string[]; free: string[] }
 
-const underRoot = (target: string, root: string): boolean => target === root || target.startsWith(root.endsWith(sep) ? root : root + sep);
+/**
+ * The form two paths are compared in. APFS is case-insensitive and realpath keeps the typed case, so `.pi/PI-WARDEN.JSON`
+ * and `.pi/pi-warden.json` are one file on this disk (measured on APFS, 21 Oct 2026); folding on every platform makes a
+ * hold of the other case on a case-sensitive disk the only cost.
+ */
+export function foldPath(path: string): string {
+  return path.normalize("NFC").toLowerCase();
+}
+
+const underRoot = (target: string, root: string): boolean => {
+  const file = foldPath(target);
+  const dir = foldPath(root);
+  return file === dir || file.startsWith(dir.endsWith(sep) ? dir : dir + sep);
+};
 
 /** pi-warden's own config as the OS resolves it: the project file, and the user's pi-warden directory. */
 function configRoots(cwd: string | undefined, dirs: HostDirs): ConfigRoots {
   const files = new Set<string>();
-  if (cwd) files.add(resolvedTarget(projectConfigPath(cwd, dirs)));
+  if (cwd) files.add(foldPath(resolvedTarget(projectConfigPath(cwd, dirs))));
   // `/warden index` asks the session model to write the capability index, so that one folder inside the user directory
   // stays free: it holds recommendations, never a check.
   return { files, dirs: [resolvedTarget(dirname(userConfigPath(dirs)))], free: [resolvedTarget(indexDir(process.env, dirs))] };
@@ -2327,15 +2340,14 @@ function configRoots(cwd: string | undefined, dirs: HostDirs): ConfigRoots {
 /** A resolved path that is pi-warden's own config: the project file, any `pi-warden.json` in a `.pi` directory, or a
  *  file in the user's pi-warden directory. */
 function isConfigTarget(target: string, roots: ConfigRoots, configDirName: string): boolean {
-  if (roots.files.has(target)) return true;
-  if (basename(target) === PROJECT_CONFIG_FILE) {
-    const parent = basename(dirname(target));
+  if (roots.files.has(foldPath(target))) return true;
+  if (foldPath(basename(target)) === foldPath(PROJECT_CONFIG_FILE)) {
+    const parent = foldPath(basename(dirname(target)));
     // A vendored or copied project file is the same file to whoever edits it, whatever project it sits in.
-    if (parent === configDirName || parent === ".pi") {
-      // Tests and drives build scratch projects under the temp directory: a project that is one directory below a temp
-      // root keeps its file free. The session's own file is `roots.files` above, so it is never exempt.
-      const scratchProject = dirname(dirname(dirname(target)));
-      return !tempRoots().some(root => root === scratchProject);
+    if (parent === foldPath(configDirName) || parent === ".pi") {
+      // Tests and drives build scratch projects under the temp directory, at any depth: a project there keeps its file
+      // free, because a drive writes one as a fixture. The session's own file is `roots.files` above, checked first.
+      return !tempRoots().some(root => underRoot(target, root));
     }
   }
   if (roots.free.some(root => underRoot(target, root))) return false;
@@ -2445,7 +2457,7 @@ function commandWriteTargets(command: string, cwd: string | undefined, depth: nu
         for (const source of sources) {
           const bare = source.replace(/\/+$/, "");
           push(join(destination, basename(bare)), dir);
-          if (basename(bare) === ".pi") push(join(destination, ...(source.endsWith("/") ? [] : [".pi"]), PROJECT_CONFIG_FILE), dir);
+          if (foldPath(basename(bare)) === ".pi") push(join(destination, ...(source.endsWith("/") ? [] : [".pi"]), PROJECT_CONFIG_FILE), dir);
         }
       }
       continue;
@@ -2468,7 +2480,7 @@ function commandWriteTargets(command: string, cwd: string | undefined, depth: nu
     }
   }
   // A `cd` the reader cannot resolve leaves the directory unknown: the file name is the only fact left.
-  if (unresolved) for (const target of [...targets, ...sinkNames]) if (!isAbsolute(target) && basename(target) === PROJECT_CONFIG_FILE) named.push(target);
+  if (unresolved) for (const target of [...targets, ...sinkNames]) if (!isAbsolute(target) && foldPath(basename(target)) === foldPath(PROJECT_CONFIG_FILE)) named.push(target);
   return { targets, named };
 }
 

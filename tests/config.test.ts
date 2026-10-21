@@ -664,7 +664,7 @@ test("the notice names every real loosening: switches, thresholds, lists and vis
     [{ stuck: { minFailures: 9 } }, "stuck-check"],
     [{ waste: { enabled: false } }, "waste note"],
     [{ context: { largeOutput: { enabled: false } } }, "large-output notice"],
-    [{ cause: { windowDays: 90 } }, "cause-check"],
+    [{ cause: { windowDays: 1 } }, "cause-check"],
     [{ done: { claimsDone: 0.95 } }, "done-check"],
     [{ done: { uiProof: false } }, "done-check"],
   ] as const) assert.ok(named(raw).includes(name), JSON.stringify(raw));
@@ -677,7 +677,7 @@ test("the notice names every real loosening: switches, thresholds, lists and vis
   assert.match(added[0]!.detail ?? "", /screenshot\.sh/);
   assert.deepEqual(of({ done: { visualTools: { tools: [] } } }), [], "no visual tool is stricter");
   // A stricter value loosens nothing.
-  assert.deepEqual(of({ rules: { threshold: 0.5 }, stuck: { minFailures: 1 }, cause: { windowDays: 2 } }), []);
+  assert.deepEqual(of({ rules: { threshold: 0.5 }, stuck: { minFailures: 1 }, cause: { windowDays: 90 } }), []);
 });
 
 test("every key a project file can set is classified as loosening a check or not a check", async () => {
@@ -698,4 +698,50 @@ test("every key a project file can set is classified as loosening a check or not
   for (const [path, entry] of Object.entries(table!)) {
     assert.ok(entry.kind === "none" ? Boolean(entry.why && entry.why.length) : Boolean(entry.check), `${path} says why it is not a check, or which check it loosens`);
   }
+});
+
+test("a session reads its user file once too: an outside edit waits for the next session", async () => {
+  const user = userConfigPath();
+  await writeFile(user, JSON.stringify({ mode: "steer", slop: { enabled: false } }));
+  // The snapshot the extension takes at session start: the file's content, read once.
+  const snapshot = { value: JSON.parse(await readFile(user, "utf8")) as Record<string, unknown> };
+  const opening = loadConfig({ userRaw: snapshot });
+  assert.equal(opening.mode, "steer");
+  assert.equal(opening.slop.enabled, false);
+  await writeFile(user, JSON.stringify({ mode: "advise", slop: { enabled: true } }));
+  const sameSession = loadConfig({ userRaw: snapshot });
+  assert.equal(sameSession.mode, "steer", "the snapshot decides for this session");
+  assert.equal(sameSession.slop.enabled, false, "an outside edit of any key waits");
+  assert.equal(loadConfig().mode, "advise", "a library caller without a snapshot reads the file as before");
+  await rm(user, { force: true });
+});
+
+test("each direction that loosens is named, both ways: window days, trace-only mode, judge cooldown", () => {
+  const user = defaultConfig();
+  const of = (base: typeof user, raw: unknown) => loosenedChecks(base, applyProjectOverrides(base, raw));
+  // A shorter cause window forgets earlier causes, so the repeat question is asked less: it loosens. A longer one tightens.
+  assert.deepEqual(of(user, { cause: { windowDays: 1 } }).map(check => check.name), ["cause-check"]);
+  assert.deepEqual(of(user, { cause: { windowDays: 90 } }), []);
+  assert.match(of(user, { cause: { windowDays: 1 } })[0]!.detail ?? "", /window days 7 → 1/);
+  // "all" keeps every mismatch in the trace only and "none" always steers, so moving toward "all" loosens.
+  const traceOnly = applyUserOverrides(user, { action: { intentTraceOnly: "all" } });
+  assert.deepEqual(of(traceOnly, { action: { intentTraceOnly: "none" } }), [], "steering every mismatch is stricter");
+  const steers = applyUserOverrides(user, { action: { intentTraceOnly: "none" } });
+  assert.match(of(steers, { action: { intentTraceOnly: "all" } })[0]?.detail ?? "", /trace-only mode none → all/);
+  // Fewer failures cool the judge down sooner, so a lower value loosens.
+  assert.deepEqual(of(user, { judge: { failuresBeforeCooldown: 1 } }).map(check => check.name), ["judge"]);
+  assert.match(of(user, { judge: { failuresBeforeCooldown: 1 } })[0]!.detail ?? "", /failures before cooldown 3 → 1/);
+  assert.deepEqual(of(user, { judge: { failuresBeforeCooldown: 9 } }), []);
+});
+
+test("an empty loosened set is a record of its own, so the same set coming back reads as different", () => {
+  writeLoosenRecord(project, [{ name: "cause-check", detail: "window days 7 → 1" }]);
+  writeLoosenRecord(project, []);
+  assert.deepEqual(readLoosenRecord(project), [], "the empty set is recorded, not missing");
+  assert.notEqual(readLoosenRecord(project), undefined, "a missing record and an empty one are different");
+  // A set that comes back after the empty record is not the recorded set, so its line shows again.
+  const recorded = readLoosenRecord(project)!;
+  assert.notEqual(recorded.length, 1);
+  writeLoosenRecord(project, []);
+  assert.deepEqual(readLoosenRecord(project), []);
 });

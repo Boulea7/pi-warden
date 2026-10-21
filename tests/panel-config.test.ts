@@ -23,7 +23,7 @@ const selectors = [
 ] satisfies Array<{ path: string; options: readonly string[] }>;
 
 /** Build the real overlay with temporary host directories and observe only public interactions. */
-function configPanel(t: TestContext, raw?: Record<string, unknown>, effective?: (root: string, dirs: HostDirs) => WardenConfig, size = { rows: 256, width: 240 }) {
+function configPanel(t: TestContext, raw?: Record<string, unknown>, effective?: (root: string, dirs: HostDirs) => WardenConfig, size = { rows: 256, width: 240 }, options: { userRaw?: Record<string, unknown>; onWrite?: (changes: ReadonlyMap<string, unknown>) => void } = {}) {
   const root = mkdtempSync(join(tmpdir(), "pi-warden-panel-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const dirs: HostDirs = { agentDir: join(root, "agent"), configDirName: ".pi" };
@@ -40,7 +40,7 @@ function configPanel(t: TestContext, raw?: Record<string, unknown>, effective?: 
       });
     },
   };
-  const controller = openConfigPanel(ui, effective?.(root, dirs) ?? loadConfig({ dirs }), { dirs });
+  const controller = openConfigPanel(ui, effective?.(root, dirs) ?? loadConfig({ dirs }), { dirs, ...options });
   const press = (data: string) => {
     assert.ok(component?.handleInput, "the overlay exposes keyboard input");
     component.handleInput(data);
@@ -439,4 +439,20 @@ test("config selector: 24-row backend pending notice and chosen backend remain v
   assert.equal(readUserConfig(panel.dirs).typesafeBackend, Object.keys(DECISIONS_BACKENDS)[0]);
   assert.equal(readUserConfig(panel.dirs).extra, "keep");
   assert.doesNotMatch(panel.render(), /pending edits|Changed gateway/);
+});
+
+test("the config panel shows the session's snapshot, and a save reports the changed keys", t => {
+  const seen: Array<[string, unknown]> = [];
+  const panel = configPanel(t, setNestedValue({}, "widget.barMode", "live"), undefined, { rows: 256, width: 240 }, {
+    userRaw: setNestedValue({}, "widget.barMode", "stack"),
+    onWrite: changes => { for (const entry of changes) seen.push(entry); },
+  });
+  // The file says live, the snapshot says stack: the panel shows what this session's checks use.
+  panel.select("widget.barMode");
+  assert.match(panel.selected("widget.barMode")!, /‹ stack ›/);
+  panel.press(enter);
+  panel.press(right);
+  panel.press(enter);
+  assert.equal(getNestedValue(readUserConfig(panel.dirs), "widget.barMode"), "live", "the file holds the new value");
+  assert.deepEqual(seen, [["widget.barMode", "live"]], "the session hears the key it must apply at once");
 });

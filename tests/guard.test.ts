@@ -1971,9 +1971,10 @@ test("a write or edit of pi-warden's own project file is held, whatever the spel
     assert.equal(wardenConfigHeld("write", { path, content: "{}" }).length, 1, `write ${path}`);
     assert.equal(wardenConfigHeld("edit", { path }).length, 1, `edit ${path}`);
   }
-  // A copy of the file ruled by another project is the same file to whoever edits it.
-  await mkdir(join(cwd, "vendor", ".pi"), { recursive: true });
-  assert.equal(wardenConfigHeld("write", { path: "vendor/.pi/pi-warden.json", content: "{}" }).length, 1);
+  // A copy of the file ruled by another project is the same file to whoever edits it. The project sits outside temp,
+  // because a scratch project under temp keeps its file free.
+  const elsewhere = "/opt/pi-warden-vendor-test";
+  assert.deepEqual(configWriteTargets("write", { path: "vendor/.pi/pi-warden.json", content: "{}" }, elsewhere, defaultHostDirs()), [join(elsewhere, "vendor", ".pi", "pi-warden.json")]);
 });
 
 test("a write into pi-warden's own user directory is held, after a symlink or a .. segment", async () => {
@@ -2044,10 +2045,8 @@ const userDir = () => join(process.env.PI_CODING_AGENT_DIR!, PACKAGE_NAME);
 
 test("a write to pi-warden's config through a shell string, a cd, curl or wget is held", async () => {
   await mkdir(join(cwd, ".pi"), { recursive: true });
-  await mkdir(join(cwd, "sub", ".pi"), { recursive: true });
   await mkdir(join(userDir(), "holds"), { recursive: true });
   const project = real(join(cwd, ".pi", "pi-warden.json"));
-  const subProject = real(join(cwd, "sub", ".pi", "pi-warden.json"));
   const userConfig = real(join(userDir(), "config.json"));
   for (const [command, target] of [
     // A shell string was read as one word, so the redirect inside it was invisible to the hold.
@@ -2057,9 +2056,8 @@ test("a write to pi-warden's config through a shell string, a cd, curl or wget i
     [`dash -c 'echo {} > .pi/pi-warden.json'`, project],
     // A cd was not followed, so the relative target resolved against the call's directory.
     [`cd .pi && printf '%s' '{"cause":{"enabled":false}}' > pi-warden.json`, project],
-    [`cd sub && printf '%s' '{}' > .pi/pi-warden.json`, subProject],
     [`pushd .pi && printf '%s' '{}' > pi-warden.json`, project],
-    [`cd sub && printf '%s' '{}' > ".pi/pi-warden.json"`, subProject],
+    [`cd .pi && printf '%s' '{}' > "./pi-warden.json"`, project],
     // The main defect: a cd to the user's own directory rewrote the live user config.
     [`cd ${userDir()} && printf '%s' '{"mode":"steer"}' > config.json`, userConfig],
     [`cd ${userDir()}/holds && printf '%s' '{}' > ../config.json`, userConfig],
@@ -2130,8 +2128,43 @@ test("a scratch project under the temp directory stays free; the session's own p
   await rm(scratch, { recursive: true, force: true });
 });
 
-test("a held write after a cd is named in the directory the cd names", async () => {
-  await mkdir(join(cwd, "sub", ".pi"), { recursive: true });
-  const held = wardenConfigHeld("bash", { command: "cd sub && printf '%s' '{}' > .pi/pi-warden.json" });
-  assert.deepEqual(held, [real(join(cwd, "sub", ".pi", "pi-warden.json"))]);
+test("a held write after a cd is named in the directory the cd names", () => {
+  // Outside temp, so the sub-project's file is held rather than free as a scratch project's is.
+  const elsewhere = "/opt/pi-warden-cd-test";
+  const held = configWriteTargets("bash", { command: "cd sub && printf '%s' '{}' > .pi/pi-warden.json" }, elsewhere, defaultHostDirs());
+  assert.deepEqual(held, [join(elsewhere, "sub", ".pi", "pi-warden.json")]);
+});
+
+// --- one comparison for every config path, and a scratch project at any depth ------------------
+
+test("another case of a config path is the same file, through bash and through the write tool", async () => {
+  await mkdir(join(cwd, ".pi"), { recursive: true });
+  await writeFile(join(cwd, ".pi", "pi-warden.json"), "{}\n");
+  await mkdir(join(process.env.PI_CODING_AGENT_DIR!, PACKAGE_NAME), { recursive: true });
+  for (const [tool, input] of [
+    ["bash", { command: "printf '%s' '{\"cause\":{\"enabled\":false}}' > .pi/PI-WARDEN.JSON" }],
+    ["bash", { command: "printf '%s' '{}' > .PI/pi-warden.json" }],
+    ["bash", { command: `printf '%s' '{"mode":"advise"}' > ${join(process.env.PI_CODING_AGENT_DIR!, "PI-WARDEN", "config.json")}` }],
+    ["write", { path: ".pi/PI-WARDEN.JSON", content: "{}" }],
+    ["edit", { path: ".PI/pi-warden.json" }],
+    ["write", { path: join(process.env.PI_CODING_AGENT_DIR!, "PI-WARDEN", "config.json"), content: "{}" }],
+  ] as const) {
+    assert.equal(wardenConfigHeld(tool, input).length, 1, `${tool} ${JSON.stringify(input)}`);
+  }
+  // The read side stays free in another case too.
+  assert.deepEqual(wardenConfigHeld("bash", { command: "cat .pi/PI-WARDEN.JSON" }), []);
+});
+
+test("a scratch project's file is free at any depth under temp, and the session's own file is held in another case", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-warden-temp-layout-"));
+  const deep = join(root, "drive", "proj");
+  await mkdir(join(deep, ".pi"), { recursive: true });
+  await writeFile(join(deep, ".pi", "pi-warden.json"), "{}\n");
+  // Two levels below the temp root, as a drive builds it, the file is a fixture.
+  assert.deepEqual(wardenConfigHeld("bash", { command: `echo {} > ${join(deep, ".pi", "pi-warden.json")}` }), []);
+  assert.deepEqual(wardenConfigHeld("bash", { command: `echo {} > ${join(deep, "sub", "..", ".pi", "pi-warden.json")}` }), []);
+  // The same file is the session's own project file when the session runs there, in any case.
+  assert.equal(configWriteTargets("write", { path: join(deep, ".pi", "PI-WARDEN.JSON"), content: "{}" }, deep, defaultHostDirs()).length, 1);
+  assert.equal(configWriteTargets("bash", { command: "echo {} > .PI/PI-WARDEN.JSON" }, deep, defaultHostDirs()).length, 1);
+  await rm(root, { recursive: true, force: true });
 });
