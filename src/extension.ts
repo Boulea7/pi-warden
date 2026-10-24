@@ -25,8 +25,8 @@ import { ArmingTracker, unparseableArmingRules } from "./arming.js";
 import * as configModule from "./config.js";
 import { applyUserOverrides, defaultConfig, getNestedValue, isMode, loadConfig, loosenNotice, loosenedChecks, readLoosenRecord, readProjectConfig, readUserConfigFile, writeLoosenRecord, PACKAGE_NAME, parseConfigValue, PROJECT_CONFIG_FILE, projectConfigPath, readUserConfig, setNestedValue, userConfigPath, writeUserConfig } from "./config.js";
 import type { WardenConfig, WardenMode } from "./config.js";
-import { checkSkipReason, classifyToolResult, doneNudge, emptyEvidence, evaluateDone, finalAssistantText, formatDone, isVisualCheck, localUrl, needsDoneCheck, projectCheckCommand, recordOutcome as recordDoneOutcome, recordUi } from "./done.js";
-import type { RunEvidence } from "./done.js";
+import { checkSkipReason, classifyToolResult, doneNudge, doneNoteLine, DONE_NOTE_TYPE, emptyEvidence, evaluateDone, finalAssistantText, formatDone, isVisualCheck, localUrl, needsDoneCheck, projectCheckCommand, recordOutcome as recordDoneOutcome, recordUi } from "./done.js";
+import type { DoneNote, RunEvidence } from "./done.js";
 import { causeNudge, causePreFilter, emptyCauseActivity, evaluateCause, formatCause, recordCauseActivity } from "./cause.js";
 import type { CauseActivity, CauseStore } from "./cause.js";
 import { CONFIG_HOLD_ID, configWriteTargets, createdScratch, describeAsked, evaluateAction, formatVerdictTokens, higher, inertPathRules, intentSteer, largeOutputNotice, movedInTargets, offTaskSteer, pruneScratch, scratchCandidates, SCRATCH_PATHS_ENV, scratchPaths, scoreFreeReason, shouldProceedMessage, SLOP_LABELS, SteerRepeatWindow, steerReason, stripDataText, unknownExemptIds, wardenHostPaths, writeSinkTargets, isVisibleCommand } from "./guard.js";
@@ -548,6 +548,13 @@ export default function wardenExtension(host: ExtensionAPI): void {
       console.warn("pi-warden: trial record failed:", error instanceof Error ? error.message : String(error));
     }
   };
+  /**
+   * The durable copy of a done notice: an unverified claim gets one line under its reply, where the owner reads it. A
+   * custom entry never enters the model's context, and a host without the entry API keeps the trace line as its record.
+   */
+  const appendDoneNote = (note: DoneNote): void => {
+    if (typeof pi.appendEntry === "function") pi.appendEntry(DONE_NOTE_TYPE, note);
+  };
   /** Whether the silent arm withholds this delivery; a withheld delivery is recorded, redacted and clipped to 300 chars. */
   const trialHolds = (kind: SuppressedKind, guard: string, text: string): boolean => {
     if (trialArm !== "silent" || !isSuppressed(kind)) return false;
@@ -570,7 +577,8 @@ export default function wardenExtension(host: ExtensionAPI): void {
   let evidence: RunEvidence = emptyEvidence();
   /** Every finished tool call of the run, for the cause-check's judgment of what the run actually checked. */
   let activity: CauseActivity = emptyCauseActivity();
-  let doneNudged = false;
+  /** The once-per-prompt budget of the done notice; a later unverified claim in the same prompt is judged and traced. */
+  let doneNoted = false;
   let causeNudged = false;
   /** Project memory of unchecked causes, for the cause-check's repeat steer. */
   const causeStore: CauseStore = {
@@ -1181,6 +1189,16 @@ export default function wardenExtension(host: ExtensionAPI): void {
   let sessionCwd = process.cwd();
   let sessionTrusted = false;
 
+  // A done note is a custom session entry, not a message: Pi draws it under the reply and never adds it to the model's
+  // context. Checked like the other optional APIs, so a host without entry rendering keeps running without the note.
+  if (typeof pi.registerEntryRenderer === "function") {
+    pi.registerEntryRenderer<DoneNote>(DONE_NOTE_TYPE, (entry, _options, theme) => {
+      const note = entry.data;
+      if (!note?.reasons.length) return undefined;
+      return new tuiModule.Text(theme.fg("dim", doneNoteLine(note)), 0, 0);
+    });
+  }
+
   // Record-only: neither calibration met the activation gate, so nothing claims the event or acts on the answers.
   pi.events?.on("pi-subagents/supervision-evaluate/v1", createSupervisionHandler({
     config: () => guardCurrentSections(completeConfig(sessionConfig(sessionCwd, sessionTrusted))).config,
@@ -1272,7 +1290,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
     wasteTipOffered = false;
     evidence = emptyEvidence();
     activity = emptyCauseActivity();
-    doneNudged = false;
+    doneNoted = false;
     causeNudged = false;
     prose.reset();
     // Clean up temp output dirs from the previous session.
@@ -1477,7 +1495,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
       }
     }
     fullOutputs = new Map();
-    doneNudged = false;
+    doneNoted = false;
     causeNudged = false;
     finals.reset();
     runaway.reset();
@@ -1765,10 +1783,10 @@ export default function wardenExtension(host: ExtensionAPI): void {
     ctx.abort();
   });
 
-  // Each low-level run collects its own evidence of changes and checks. A run that a warden follow-up started continues
-  // the previous run's work, so it keeps that evidence: the changes behind a done-check nudge still need a passing check.
+  // The change-and-check ledger lives for the session: a passing check in an earlier turn still covers a change no later
+  // one touched, so the done-check stops crying wolf on a claim it already verified. `session_start` resets it.
   pi.on("agent_start", async (_event, ctx) => {
-    evidence = emptyEvidence(); activity = emptyCauseActivity();
+    activity = emptyCauseActivity();
     // Turn rules need a baseline of the working tree. The snapshot starts here as a promise and is awaited at
     // agent_end, so this hook never waits for git to hash the changed and untracked files. One trace line when a run
     // with turn rules gets no baseline. With no turn rules a failed snapshot is silent: a project without them sees
@@ -2898,13 +2916,13 @@ export default function wardenExtension(host: ExtensionAPI): void {
         if (steer(ctx, config, "prose", nudge, { line: proseLine, details: proseDetail })) watchSteer(ctx, config, ["prose"], {}, true);
       } else record(ctx, config, "prose", proseLine, proseDetail);
     }
-    let doneSteered = false;
+    let doneReported = false;
     if (doneCheck) {
       stats.doneChecks++;
       const verdict = await doneCheck;
       if (verdict.error) noteError(ctx, verdict.error, verdict.errorCode);
-      // At most one nudge per user prompt; a later unverified claim is still judged and recorded.
-      const nudge = verdict.unverified && config.done.nudge && !doneNudged
+      // At most one notice per user prompt; a later unverified claim is still judged and recorded.
+      const nudge = verdict.unverified && config.done.nudge && !doneNoted
         ? doneNudge(verdict, { lastCheck: lastPassedCheck?.cwd === ctx.cwd ? lastPassedCheck.call : undefined, projectCheck: projectCheckCommand(ctx.cwd), localUrl: lastLocalUrl })
         : undefined;
       const doneLine = formatDone(verdict, config.widget.done);
@@ -2914,19 +2932,25 @@ export default function wardenExtension(host: ExtensionAPI): void {
         stats.unverified++;
         if (ctx.hasUI && config.notices) ctx.ui.notify(`warden · done-check: ${verdict.reasons.join("; ")}`, "warning");
         if (nudge) {
-          doneNudged = true;
-          if (steer(ctx, config, "done", nudge, { line: doneLine, details: doneDetail })) { watchSteer(ctx, config, ["done"]); doneSteered = true; doneLineRecorded = true; }
+          doneNoted = true;
+          // The notice reaches the owner only: the entry carries the same line under the reply, and nothing is sent to the
+          // model, so no follow-up turn starts. A silenced trial arm withholds the entry too.
+          if (steer(ctx, config, "done", nudge, { line: doneLine, details: doneDetail })) {
+            doneReported = true;
+            doneLineRecorded = true;
+            appendDoneNote({ reasons: verdict.reasons, at: Date.now() });
+          }
         }
       }
       if (!doneLineRecorded) record(ctx, config, "done", doneLine, doneDetail);
     }
-    // The cause-check judges a final reply that states a cause or hands a check to a person, and sends one follow-up
-    // unless the done-check already steered this reply. The offline pre-filter keeps a reply about results costless.
+    // The cause-check judges a final reply that states a cause or hands a check to a person, and reports its own notice
+    // unless the done-check already reported this reply. The offline pre-filter keeps a reply about results costless.
     if (config.cause.enabled && causePreFilter(finalMessage)) {
       stats.causeChecks++;
       const causeVerdict = await evaluateCause(task, finalMessage, activity, { config: config.cause, judge, timeoutMs: config.timeoutMs, signal: ctx.signal, store: causeStore, projectRoot: ctx.cwd, now: Date.now() });
       if (causeVerdict.error) noteError(ctx, causeVerdict.error, causeVerdict.errorCode);
-      const causeSteer = causeVerdict.unchecked && config.cause.nudge && !causeNudged && !doneSteered ? causeNudge(causeVerdict) : undefined;
+      const causeSteer = causeVerdict.unchecked && config.cause.nudge && !causeNudged && !doneReported ? causeNudge(causeVerdict) : undefined;
       const causeLine = formatCause(causeVerdict, config.widget.cause);
       const causeDetail = causeDetails(causeVerdict, finalMessage, causeSteer);
       let causeLineRecorded = false;

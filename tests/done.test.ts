@@ -319,3 +319,22 @@ test("a failure marker anywhere in the output wins over a passing one", () => {
   assert.equal(verdict("npm test; echo \"rc=$?\"; npm run build 2>&1 | tail -3", "> app test\nok\nrc=0\n> app build\nsrc/a.ts(1,1): something broke\n"), "unknown", "the test's printed code does not vouch for the hidden build");
   assert.equal(verdict("pytest -q 2>&1 | tail -3", "..E\n2 passed, 1 error in 0.20s\n"), "check-fail", "an error count above 0 wins over the passed count");
 });
+
+test("the done note names the guard and the reason, and carries the time", () => {
+  const note: done.DoneNote = { reasons: ["reports completion (0.92) after 1 file change with no test, build, or lint run since the last change"], at: 1_700_000_000_000 };
+  assert.equal(done.DONE_NOTE_TYPE, "pi-warden-done");
+  assert.equal(done.doneNoteLine(note), `pi-warden · done-check · ${note.reasons[0]}`);
+});
+
+test("a passing check in an earlier turn still covers a change no later one touched", () => {
+  const evidence = done.emptyEvidence();
+  done.recordOutcome(evidence, "mutation", { path: "src/a.ts" }, "edit");
+  done.recordOutcome(evidence, "check-pass", { command: "npm test" }, "bash");
+  assert.equal(done.needsDoneCheck(evidence), false, "the pass covers the change");
+  // The next turn changes nothing: the same ledger still says the change is verified.
+  assert.equal(done.needsDoneCheck(evidence), false);
+  done.recordOutcome(evidence, "mutation", { path: "src/b.ts" }, "edit");
+  assert.equal(done.needsDoneCheck(evidence), true, "an earlier pass does not cover a later change");
+  done.recordOutcome(evidence, "check-pass", { command: "npm test" }, "bash");
+  assert.equal(done.needsDoneCheck(evidence), false);
+});

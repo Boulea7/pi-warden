@@ -457,7 +457,10 @@ export function finalAssistantText(messages: ReadonlyArray<MessageLike>): string
   return undefined;
 }
 
-/** The checks that ran after the latest change: only those ran on the code as it stands now. Earlier ones stay as history. */
+/**
+ * The checks that ran after the latest change: only those ran on the code as it stands now. Earlier ones stay as history.
+ * The evidence lives for the session, so a passing check from an earlier turn still covers a change no later one touched.
+ */
 export function freshChecks(evidence: RunEvidence): RunEvidence["checks"] {
   return evidence.checks.slice(evidence.checksBeforeMutation ?? 0);
 }
@@ -550,7 +553,7 @@ export async function evaluateDone(task: string | undefined, finalMessage: strin
   // The file type already says a visual check applies, so `verification_applies` (about tests and builds) does not gate it.
   const unseenUi = claimed ? evidence.unseenUi : undefined;
   const unverified = codeUnverified || unseenUi !== undefined;
-  // Total checks, not fresh: a false claim is nothing ever run in the run; a stale check is unverified, not a lie.
+  // Total checks, not fresh: a false claim is nothing ever run in the session; a stale check is unverified, not a lie.
   const falseClaim = unverified && judgment.claimsVerified >= 0.7 && evidence.checks.length === 0;
   const reasons: string[] = [];
   if (codeUnverified) {
@@ -641,4 +644,20 @@ export function doneNudge(verdict: DoneVerdict, hint: NudgeHint = {}): string {
 
 export function formatDone(verdict: DoneVerdict, template: string = DEFAULT_TEMPLATES.done): string {
   return renderTemplate(template, doneTokens(verdict));
+}
+
+/**
+ * The custom session entry of an unverified claim: the owner reads only the last reply, so the note rides the transcript
+ * under it. Pi keeps custom entries out of the model's context.
+ */
+export const DONE_NOTE_TYPE = "pi-warden-done";
+
+export interface DoneNote {
+  reasons: string[];
+  at: number;
+}
+
+/** The one dim line the entry renderer draws: the guard, then why the claim stands unverified. */
+export function doneNoteLine(note: DoneNote): string {
+  return `pi-warden · done-check · ${note.reasons.join("; ")}`;
 }

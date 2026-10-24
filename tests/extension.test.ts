@@ -12,6 +12,7 @@ import type { Extension, ExtensionContext, RegisteredCommand } from "@earendil-w
 import { initSchema, queryHoldsForProject, recordCause } from "../src/learning.js";
 import { readRulesLog, rulesLogPath } from "../src/rules-log.js";
 import { defaultConfig, loadConfig, loosenRecordPath } from "../src/config.js";
+import { doneNoteLine, DONE_NOTE_TYPE, type DoneNote } from "../src/done.js";
 import { policyMatches, CONSCIENCE_BETA_POLICY } from "../src/load.js";
 import { _testSetIndexRunning, askedBeforeReply, assistantPlan } from "../src/extension.js";
 import { SHELL_RULES_CHECKS } from "../src/turn-rules.js";
@@ -62,6 +63,8 @@ let releaseJudge: (() => void) | undefined;
 /** Hold the next judgment until the test releases it, so the caller can prove it did not wait for the answer. */
 const holdNextJudge = () => { judgeGate = new Promise<void>(resolve => { releaseJudge = resolve; }); };
 const sentMessages: Array<{ message: { customType: string; content: string }; options?: Record<string, unknown> }> = [];
+/** Custom session entries the extension appended: the durable note under a reply, which the host keeps out of context. */
+const appended: Array<{ customType: string; data?: unknown }> = [];
 /** The session the trace is read from; a test that runs under a named session sets it. */
 let traceSession: string | undefined;
 /** Where the extension writes its trace, so the tests can read what a guard reported. */
@@ -338,6 +341,8 @@ before(async () => {
   // The runtime's action methods throw until Pi's runner binds them; capture steer messages instead.
   result.runtime.sendMessage = (message, options) => { sentMessages.push({ message: message as { customType: string; content: string }, ...(options ? { options: options as Record<string, unknown> } : {}) }); };
   result.runtime.sendUserMessage = (content: string | unknown[]) => { sentUserMessages.push(typeof content === "string" ? content : JSON.stringify(content)); };
+  // Custom entries land in the session log, out of the model's context; capture them the way Pi's runner would store them.
+  result.runtime.appendEntry = (customType: string, data?: unknown) => { appended.push({ customType, data }); };
 });
 
 beforeEach(async () => {
@@ -348,7 +353,7 @@ beforeEach(async () => {
   notices.length = 0; widgets.length = 0; confirms.length = 0; busEvents.length = 0;
   confirmResult = true; editorText = undefined; networkCalls = 0; failNetwork = false; hangNetwork = false; failStatus = undefined; prompt = "Run the test suite";
   keyPrompts = 0; keyInput = undefined; modelListCalls = 0; reportBaseline = (await recordedSince()).length; requests.length = 0; requestUrls.length = 0; requestAuth.length = 0;
-  answeredRequests = 0; supervisionClaims = 0; judgeGate = undefined; releaseJudge = undefined;
+  answeredRequests = 0; supervisionClaims = 0; judgeGate = undefined; releaseJudge = undefined; appended.length = 0;
   widgetComponent = undefined; widgetPlacement = undefined; customCalls.length = 0; openPanels.length = 0; panelClosed.length = 0; renders = 0;
   await rm(join(temporary, "agent", "pi-typesafe"), { recursive: true, force: true });
   nextAnswers = { irreversible: 0.1, off_task: 0.1, scope: "expected_step" };
@@ -2523,44 +2528,76 @@ test("done-check: an unverified completion claim after file changes gets one fol
   assert.equal(networkCalls, 4);
   assert.equal((await shownNotices()).length, 2, "a question to the user is not an unverified claim");
 
+  const changesBefore = (requests.at(-1)!.state.run as { file_changes: number }).file_changes;
   await newPrompt("delete the scratch files");
   await toolResult("bash", { command: "rm -rf /tmp/scratch" }, "", false);
   await agentEnd("Deleted /tmp/scratch.");
-  assert.equal(networkCalls, 4, "shell side effects alone are not code changes");
+  assert.equal(networkCalls, 5, "the session ledger is still unverified, so the claim is judged");
+  assert.equal((requests.at(-1)!.state.run as { file_changes: number }).file_changes, changesBefore, "shell side effects alone are not code changes");
 });
 
-test("done-check: the nudge is reported once and starts no run, so the next run begins with empty evidence", async () => {
+test("done-check: one durable note goes under an unverified reply and nothing goes to the model", async () => {
   await grantConsent();
   await newPrompt("fix the parser bug");
   await toolResult("edit", { path: "src/parser.ts", edits: [] }, "ok", false);
   nextAnswers = { claims_done: 0.92, claims_verified: 0.1, verification_applies: 0.9, outcome: "complete" };
   await agentEnd("Fixed the parser bug.");
-  assert.equal((await shownNotices()).length, 1, "the unverified claim is nudged");
-  assert.deepEqual(sentMessages, [], "the nudge asks for no follow-up turn");
+  assert.equal((await shownNotices()).length, 1, "the unverified claim is reported once");
+  assert.deepEqual(sentMessages, [], "nothing is sent to the model for it");
+  const notes = appended.filter(entry => entry.customType === DONE_NOTE_TYPE);
+  assert.equal(notes.length, 1, "one custom entry under the reply");
+  const note = notes[0]!.data as DoneNote;
+  assert.match(note.reasons.join("; "), /no test, build, or lint run since the last change/);
+  assert.ok(Number.isFinite(note.at), "the entry carries the time");
+  assert.equal((await reportedFor(["done"])).length, 1, "one done trace line, not a second copy");
 
-  // A later run of the same prompt is judged on its own evidence, which now holds no change.
+  // A later run of the same prompt is still unverified, but the once-per-prompt budget is spent: no second note.
   await fire("agent_start", {});
   await agentEnd("Done.");
-  assert.equal((await shownNotices()).length, 1, "no second nudge for the same prompt");
-
-  // A new user prompt starts with empty evidence.
-  await newPrompt("explain the parser");
-  await agentEnd("The parser reads tokens left to right.");
-  assert.equal(networkCalls, 1, "no changes in this prompt: nothing to verify");
+  assert.equal((await shownNotices()).length, 1, "no second notice for the same prompt");
+  assert.equal(appended.filter(entry => entry.customType === DONE_NOTE_TYPE).length, 1, "no second note for the same prompt");
 });
 
-test("done-check: a new user prompt after a nudge starts with empty evidence", async () => {
+test("done-check: the note renderer draws one dim line of the guard and the reason", async () => {
+  const renderer = extension.entryRenderers?.get(DONE_NOTE_TYPE);
+  assert.ok(renderer, "the renderer is registered at load");
+  const note: DoneNote = { reasons: ["reports completion (0.92) after 1 file change with no test, build, or lint run since the last change"], at: Date.now() };
+  const component = renderer({ type: "custom", id: "done-1", parentId: null, timestamp: new Date().toISOString(), customType: DONE_NOTE_TYPE, data: note }, { expanded: false }, fakeTheme as never);
+  assert.ok(component);
+  const text = component.render(200).join("\n").trimEnd();
+  assert.equal(text, doneNoteLine(note), "one line: the guard, then the reason");
+  assert.match(text, /^pi-warden · done-check · reports completion \(0\.92\) after 1 file change/);
+});
+
+test("done-check: the session keeps the change ledger, and a new session clears it", async () => {
   await grantConsent();
   await newPrompt("fix the parser bug");
   await toolResult("edit", { path: "src/parser.ts", edits: [] }, "ok", false);
+  await toolResult("bash", { command: "npm test" }, "31 passing", false);
+  await agentEnd("Tests pass; the parser bug is fixed.");
+  assert.equal(networkCalls, 0, "a passing check after the last change verifies it");
+
+  // The next turn changes nothing: the earlier pass still covers the edit, so the claim is not judged and gets no note.
+  await newPrompt("explain the fix");
+  await agentEnd("Done: the parser reads tokens left to right.");
+  assert.equal(networkCalls, 0, "no change after the pass: no done-check");
+  assert.equal(appended.filter(entry => entry.customType === DONE_NOTE_TYPE).length, 0, "no note under a claim the pass covers");
+
+  // A change after the pass puts the session back in unverified territory.
+  await newPrompt("and the formatter");
+  await toolResult("edit", { path: "src/format.ts", edits: [] }, "ok", false);
   nextAnswers = { claims_done: 0.92, claims_verified: 0.1, verification_applies: 0.9, outcome: "complete" };
   await agentEnd("Fixed the parser bug.");
-  assert.equal((await shownNotices()).length, 1);
+  assert.equal(networkCalls, 1, "the edit landed after the passing check");
+  assert.deepEqual(requests.at(-1)!.state.run, { file_changes: 2, checks_run: [] }, "the pass predates the second change");
+  assert.equal(appended.filter(entry => entry.customType === DONE_NOTE_TYPE).length, 1, "the later change gets the note");
 
-  // The user answers before the nudge's run starts: the user prompt resets the evidence.
-  await newPrompt("never mind, explain the parser");
+  // A new session (new, reload, resume, fork) starts from no change and no check.
+  await sessionStart();
+  await newPrompt("explain the parser");
   await agentEnd("Done: the parser reads tokens left to right.");
-  assert.equal(networkCalls, 1, "the earlier edit is not carried into a new user prompt");
+  assert.equal(networkCalls, 1, "the new session holds no unverified change");
+  assert.equal(appended.filter(entry => entry.customType === DONE_NOTE_TYPE).length, 1, "no note for the cleared ledger");
 });
 
 test("done-check: an edit after a passing run makes the run unverified again", async () => {
@@ -2575,7 +2612,7 @@ test("done-check: an edit after a passing run makes the run unverified again", a
   await agentEnd("Tests pass; the parser bug is fixed.");
   assert.equal(networkCalls, 0, "the pass after the second edit verifies it: no done-check");
 
-  // A fresh prompt, so the one-nudge budget is open again; the stale passing run no longer covers the latest edit.
+  // A fresh prompt, so the once-per-prompt budget is open again; the stale passing run no longer covers the latest edit.
   await newPrompt("fix the parser bug again");
   await toolResult("edit", { path: "src/parser.ts", edits: [] }, "ok", false);
   await toolResult("bash", { command: "npm test" }, "31 passing", false);
@@ -2583,11 +2620,11 @@ test("done-check: an edit after a passing run makes the run unverified again", a
   nextAnswers = { claims_done: 0.9, claims_verified: 0.1, verification_applies: 0.9, outcome: "complete" };
   await agentEnd("Fixed the parser bug.");
   assert.equal(networkCalls, 1, "the edit landed after the passing run: nothing has run on the new code");
-  assert.deepEqual(requests.at(-1)!.state.run, { file_changes: 2, checks_run: [] }, "the stale pass is not verification");
+  assert.deepEqual(requests.at(-1)!.state.run, { file_changes: 4, checks_run: [] }, "the stale pass is not verification; the session's changes ride the request");
   assert.equal((await shownNotices()).length, 1, "the agent is nudged to run the checks again");
-  assert.match((await shownNotices())[0]!.message.content, /after 2 file changes with no test, build, or lint run since the last change/);
+  assert.match((await shownNotices())[0]!.message.content, /after 4 file changes with no test, build, or lint run since the last change/);
   assert.match((await shownNotices())[0]!.message.content, /Run npm test on what you changed\./, "the nudge names the check that passed earlier in this session");
-  assert.match(widgets.at(-1)!.at(-1)!, /^UNVERIFIED\s+done\s+done-check · 2 changes · 0\/0 checks passed · claims done 0\.90 /);
+  assert.match(widgets.at(-1)!.at(-1)!, /^UNVERIFIED\s+done\s+done-check · 4 changes · 0\/0 checks passed · claims done 0\.90 /);
 });
 
 test("done-check: a UI change needs a visual check after it, even after passing tests", async () => {
