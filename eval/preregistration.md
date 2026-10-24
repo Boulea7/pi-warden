@@ -45,6 +45,11 @@ batch), so they become three times the longest run of the same kind that was not
 recorded so far — 198 s for a single-shot run and 609 s for one turn of a multi-turn run. The 552
 recorded runs, including the one the old cap cut, stay in the analysis set (Corrections 8).
 
+v5, restarted on 2026-10-25 with Correction 8's caps in a new folder, before any outcome of a v5
+batch was read: the corrected timeouts cannot reach a resumed batch, because the harness freezes the
+plan in the batch's own record, so the 552-run stopped attempt leaves the analysis set and stays on
+disk as evidence, and one clean batch carries one protocol (Corrections 9).
+
 ## The stopped v3 batches
 
 The v3 batches, `deepseek/deepseek-flash` and `claude-bridge/claude-sonnet-5-5`, were stopped by the owner for cost about 13 minutes in: `deepseek/deepseek-flash` after 57 recorded runs and `claude-bridge/claude-sonnet-5-5` after 45. They are a stopped pilot: their folders stay out of version control, their outcomes are not analysed, and nothing in this registration, in a decision, or in the analysis uses them.
@@ -822,3 +827,19 @@ the power inputs, the $3 Jev cap per batch, and the commit under test.
    The runs recorded under the old cap stay in the analysis set unchanged, including the one that cap
    cut (`t2-clip` / `warden` / repeat 2), which is a task outcome and is analysed as executed; no run
    is re-executed for the cut, and the batch resumes from its own `runs.json` rather than restarting.
+
+9. 2026-10-25, before the restarted v5 `low` batch's first run and before any outcome of a v5 batch
+   was read: Correction 8's corrected timeouts cannot be applied to a resumed batch. `--timeout-min`
+   and `--arc-timeout-min` are plan keys: the harness refuses a resume whose flag differs from the
+   batch's `runs.json` plan (`--resume: --timeout-min 3.3 differs from the batch's 1.1; a resumed batch
+   keeps its plan`, exit 2), and it rewrites that plan from the stored values after every run. Editing
+   the record by hand would leave a plan block nothing else can verify, and changing the harness in the
+   middle of a batch would change what the rows measure. So the stopped attempt
+   (`eval/reports/2026-10-24-thesis-v5-low`; 552 runs, its plan 1.1 and 7.25) stays exactly as recorded,
+   its 552 runs leave the analysis set and stay on disk as evidence, and the `low` batch restarts from
+   zero in `eval/reports/2026-10-25-thesis-v5-low` under Correction 8's caps: **198 s** for a
+   single-shot run (`--timeout-min 3.3`) and **609 s** for one turn of a multi-turn run
+   (`--arc-timeout-min 10.15`). The restarted batch's plan is then the only protocol its rows were run
+   under. Everything else stays as registered: 39 repeats, seed 20261001, the 20 tasks and their
+   families, the three cells, concurrency 3, the $3 Jev cap, the analysis set, and decision rules
+   (a) to (d).
