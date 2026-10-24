@@ -20,6 +20,9 @@
  *       no per-token bill, so its dollars are Anthropic's published list prices as
  *       an equivalent for comparison, not billed spend. Quota use is judged from
  *       its token counts, which the cost axis reports alongside.
+ *   The v5 run's model, `commandcode/deepseek/deepseek-v4.1-flash`, is the same model
+ *   as A on the commandcode subscription, so it is priced as an equivalent the same
+ *   way (see `PRICES`).
  *
  * The cost axis reads agent tokens from the run's session log and Jev tokens from
  * the run's own pi-typesafe usage ledger, so a per-run dollar figure is
@@ -32,6 +35,8 @@ export const PRICE_SOURCES = {
   anthropic: "Anthropic Claude API docs, Pricing: https://docs.claude.com/en/docs/about-claude/pricing (read 2026-10-01)",
   xiaomi: "Xiaomi MiMo API Open Platform, API Pricing (MiMo-V2.5, pay as you go): https://mimo.mi.com/docs/price/pay-as-you-go (read 2026-10-01)",
   holidays: "General Office of the State Council of China, notice on the 2026 public holiday arrangements (国办发明电〔2025〕7号, 2025-11-04): https://www.gov.cn/gongbao/2025/issue_12406/202511/content_7048922.html",
+  typesafeJev: "TypeSafe's rate as pi-typesafe's own $/MTok default (DEFAULT_USD_PER_MTOK in node_modules/pi-typesafe/dist/usage.js, read 2026-10-24)",
+  subqJev: "pi-typesafe's backend registry (node_modules/pi-typesafe/dist/backends.js, read 2026-10-24): SubQ `subq-snap-preview` at $0.05 per 1M input tokens",
 };
 
 /**
@@ -103,6 +108,17 @@ export const PRICES = {
     source: PRICE_SOURCES.xiaomi,
     billed: false,
   },
+  // The commandcode subscription bills nothing per token either, so v5's model is priced as
+  // an equivalent at DeepSeek's own `deepseek-flash` rates by the call's timestamp (the same table
+  // as A), as v4 priced the CheapestInference subscription. USD per 1M tokens.
+  "commandcode/deepseek/deepseek-v4.1-flash": {
+    peak: DEEPSEEK_FLASH_PEAK,
+    "off-peak": half(DEEPSEEK_FLASH_PEAK),
+    window: deepseekWindow,
+    source: PRICE_SOURCES.deepseek,
+    holidaySource: PRICE_SOURCES.holidays,
+    billed: false,
+  },
   "deepseek/deepseek-flash": {
     peak: DEEPSEEK_FLASH_PEAK,
     "off-peak": half(DEEPSEEK_FLASH_PEAK), // 0.15 / 0.60 / 0.003 as the page lists
@@ -120,12 +136,24 @@ export const PRICES = {
 };
 
 /**
- * Jev request prices. TypeSafe bills input tokens only (output is free), which is
- * what pi-typesafe's own $/MTok default reflects; `perRequestUsd` stays 0 so the
- * cost axis prices a request count that is not separately billed. Override both
- * here when a rate changes.
+ * Jev request prices by judgment backend: the key variable each one reads, and its input
+ * price. Both bill input tokens only, so `perRequestUsd` stays 0; a request count that is
+ * not separately billed is priced by its tokens. The backend's name is also the id its key
+ * is stored under in pi-typesafe's auth.json.
  */
-export const JEV_PRICE = { perRequestUsd: 0, inputUsdPerMTok: 0.042, outputUsdPerMTok: 0 };
+export const JEV_BACKENDS = {
+  typesafe: { label: "TypeSafe", keyEnv: "TYPESAFE_API_KEY", inputUsdPerMTok: 0.042, source: PRICE_SOURCES.typesafeJev },
+  subq: { label: "SubQ", keyEnv: "SUBQ_API_KEY", inputUsdPerMTok: 0.05, source: PRICE_SOURCES.subqJev },
+};
+
+/** The Jev price of one backend, or null for a name the table does not hold. */
+export function jevPrice(backend) {
+  const entry = JEV_BACKENDS[backend];
+  return entry ? { perRequestUsd: 0, inputUsdPerMTok: entry.inputUsdPerMTok, outputUsdPerMTok: 0 } : null;
+}
+
+/** TypeSafe's rate, the default of a run that names no Jev backend. */
+export const JEV_PRICE = jevPrice("typesafe");
 
 /**
  * The rates for one model call: `{ input, output, cacheRead, cacheWrite, window }`,

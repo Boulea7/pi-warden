@@ -118,3 +118,32 @@ test("the subscription models are priced as equivalents: model 1 at DeepSeek's r
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("the commandcode subscription model is priced as the same equivalent as A, by each call's timestamp", () => {
+  const dir = mkdtempSync(join(tmpdir(), "eval-cost-"));
+  try {
+    const model = "commandcode/deepseek/deepseek-v4.1-flash";
+    assert.deepEqual(priceFor(model, utc("2026-09-30T02:00:00Z")), { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0, window: "peak" });
+    const one = runCost({ events, agentDir: dir, model });
+    assert.equal(one.agentUsd, runCost({ events, agentDir: dir, model: A }).agentUsd, "the same table as A, by each call's timestamp");
+    assert.deepEqual(one.windows, { peak: { calls: 1, usd: 0.3 }, "off-peak": { calls: 1, usd: 0.753 } });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the subq Jev rate prices a run only when the subq backend is named", () => {
+  const dir = mkdtempSync(join(tmpdir(), "eval-cost-"));
+  try {
+    mkdirSync(join(dir, "pi-typesafe"));
+    writeFileSync(join(dir, "pi-typesafe", "usage.json"), JSON.stringify({ days: { d: { requestsStarted: 1, inputTokens: 1_000_000 } } }));
+    const typesafe = runCost({ events, agentDir: dir, model: A });
+    assert.equal(typesafe.jevUsd, 0.042, "the default stays TypeSafe's rate");
+    const subq = runCost({ events, agentDir: dir, model: A, jevBackend: "subq" });
+    assert.equal(subq.jevUsd, 0.05, "SubQ's $0.05 per 1M input tokens");
+    assert.equal(subq.usd, 1.103);
+    assert.throws(() => runCost({ events, agentDir: dir, model: A, jevBackend: "nope" }), /no Jev price for backend "nope"/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -29,6 +29,15 @@ v4, corrected while model B's main pass ran, after it had excluded more than 10%
 
 v4, after both batches finished and before any decision-rule bound, test, or metric of a v4 batch was computed: the stops and other events of both batches are recorded (Corrections 5 and 6), and the methods behind the decision rules' bounds and p-value are fixed (Corrections 7).
 
+v5, registered on 2026-10-24 before any v5 batch exists: the run moves to the owner's flat-rate
+commandcode subscription, one model at two thinking levels, `commandcode/deepseek/deepseek-v4.1-flash`
+at `low` and then at `high`, one batch per level, run one after the other; judgments go to SubQ instead
+of TypeSafe and are priced at SubQ's own rate. The owner asked for `medium` and `high`; two measurements
+say this model has no `medium` level and that pi answers a `medium` request with `high`, so `low` and
+`high` are registered and the owner confirms that pair before launch. "The v5 run" below states every
+change against v4; the tasks, families, blocks, seed, decision rules, metrics, infrastructure rules,
+Jev-error stop, stall rule, and the commit under test are unchanged.
+
 ## The stopped v3 batches
 
 The v3 batches, `deepseek/deepseek-flash` and `claude-bridge/claude-sonnet-5-5`, were stopped by the owner for cost about 13 minutes in: `deepseek/deepseek-flash` after 57 recorded runs and `claude-bridge/claude-sonnet-5-5` after 45. They are a stopped pilot: their folders stay out of version control, their outcomes are not analysed, and nothing in this registration, in a decision, or in the analysis uses them.
@@ -402,6 +411,101 @@ concurrency 1, 2, and 3, for timings only; model B: 2 tasks x 3 cells at concurr
 for timings only), the v3 smoke runs, and the stopped v3 batches prove the pipeline and
 the speed. Their runs never enter the analysis above, and none of them was read for an
 outcome to choose the concurrency, the timeouts, or the sizes.
+
+## The v5 run (2026-10-24)
+
+Registered before any v5 batch exists. "Design", "Block order and seed" (seed 20261001), "Resume",
+"Infrastructure failures" (including the 15-minute stall rule and the 10% block rule), "Jev-error
+stop", "Metrics (primary)", "Decision rules", "Power", and "Not evidence" apply to v5 unchanged.
+This section states only what v5 changes.
+
+**Model and levels.** One agent model, `commandcode/deepseek/deepseek-v4.1-flash`, confirmed with
+`pi --list-models` (provider `commandcode`, reasoning `yes`), at two thinking levels, `low` and then
+`high`, one batch per level, run one after the other as v4 ran its two models. The owner asked for
+`medium` and then `high`. Two measurements say `medium` cannot run on this model: its provider lists
+the thinking levels `off`, `low`, `high`, `max`
+(`node_modules/pi-commandcode-provider/src/commandcode-catalog.ts`, read 2026-10-24), with no `medium`;
+and a real run at `--thinking medium` records `{"type":"thinking_level_change","thinkingLevel":"high"}`
+in its session log, so pi answers `medium` with `high` and a `medium` batch would be a second `high`
+batch. `low` and `high` are registered in that order, pending the owner's confirmation of the pair.
+
+**Smoke timings** (`PI_MODEL` and `PI_REASONING_LEVEL` read back from every run's session log;
+timings and cost only — no outcome was read, and these runs are not evidence, per "Not evidence").
+Two single-shot tasks (t6-dsn, t10-fixfail) x 3 cells x 1 repeat, and the 5-turn arc t17-clip-arc x 3
+cells x 1 repeat, each level on its own, at concurrency 3:
+
+| Level | Kind | Runs | Run seconds, mean / longest | Agent tokens, mean | Agent $, mean | Jev $, mean | Jev requests, mean |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| low | single-shot | 6 | 10.8 s / 12 s | 24,000 | 0.00128 | 0.00017 | 1.8 |
+| low | multi-turn (5 turns) | 3 | 86 s / 139 s | 181,195 | 0.01039 | 0.00090 | 9.0 |
+| high | single-shot | 6 | 14.7 s / 22 s | 29,704 | 0.00156 | 0.00019 | 2.7 |
+| high | multi-turn (5 turns) | 3 | 103 s / 145 s | 224,097 | 0.01211 | 0.00088 | 8.3 |
+
+No run was cut by the smoke's own 45-minute cap and none timed out. The Jev requests are the warden
+cell's own ledger; the control and `warden-offline` cells made none.
+
+**Sizing.** As in v4: one repeat is three cells x (15 single-shot tasks + 4 multi-turn tasks + the
+12-turn decay arc), with the arc priced at 12 turns of the measured per-turn time (low 86/5 = 17.2 s,
+high 103/5 = 20.6 s).
+
+- low: 3 x (15 x 10.8 s + 4 x 86 s + 12 x 17.2 s) = 3 x 712.4 s = 2,137 s = 0.594 h per repeat.
+  At the 98% busy slot of concurrency 3: 24 h x 0.98 / 0.594 h = **39.6, so 39 repeats** =
+  39 x 20 tasks x 3 cells = **2,340 runs**.
+- high: 3 x (15 x 14.7 s + 4 x 103 s + 12 x 20.6 s) = 3 x 879.7 s = 2,639 s = 0.733 h per repeat;
+  24 h x 0.98 / 0.733 h = **32.1, so 32 repeats** = 32 x 20 x 3 = **1,920 runs**.
+
+The 98% busy fraction is v4's measurement of the same machine and concurrency; v5's smoke made no
+queue measurement of its own (see "Not evidence" and the v5 report's gaps).
+
+**Timeouts** are three times the longest smoke run of the same kind, taken from the slower level and
+used for both levels, as v4 used one pair for both models: a single-shot run, 3 x 22 s = **66 s**
+(`--timeout-min 1.1`); one turn of a multi-turn run, 3 x 145 s = **435 s** (`--arc-timeout-min 7.25`).
+A timeout stays a task outcome.
+
+**Prices.** Agent dollars are equivalents: the commandcode subscription bills nothing per token, so
+`PRICES["commandcode/deepseek/deepseek-v4.1-flash"]` in `eval/config.mjs` prices the model at DeepSeek's
+official `deepseek-flash` peak and off-peak rates, each call by the rate of its own timestamp, exactly
+as v4 priced `cheapestinference/deepseek-v4.1-flash` (DeepSeek's price page, read 2026-10-01; the 2026
+Chinese holiday calendar unchanged). Jev dollars are SubQ's own published rate, **$0.05 per 1M input
+tokens**, output free, from pi-typesafe's installed backend registry
+(`node_modules/pi-typesafe/dist/backends.js`, read 2026-10-24), which also sets SubQ's model
+`subq-snap-preview`. `--jev-usd-cap 3` is therefore $3 of SubQ judgments per level; the smoke's
+$0.0009 per warden run over 780 warden runs of the low level estimates about $0.7 per level.
+
+**Jev backend.** Judgments go to SubQ: `--jev-backend subq` writes `typesafeBackend: "subq"` into each
+Jev cell's own pi-warden config and places pi-typesafe's stored SubQ key, or `SUBQ_API_KEY` from the
+harness's environment, in that run's own `pi-typesafe/auth.json` at mode 0600. The key never enters a
+child's environment: the harness drops the variable for every backend it knows. A run whose key is
+missing judges with judgments off, which the Jev-error stop reports. `--typesafe-cap` is not used.
+
+**Commit under test.** The `src/` tree of commit `61add30ee3c0e41162b466a1c182bed03abc6bd5`, built with
+`npm run build` at 2026-10-24T09:43:41Z. `scripts/eval-ab.mjs` loads `extensions/index.js`, which
+re-exports `dist/extension.js`, so the batch runs that build. The launch checks that
+`git diff 61add30ee3c0e41162b466a1c182bed03abc6bd5 HEAD -- src` prints nothing.
+
+Launch, `low` first and `high` on its exit code as v4 sequenced its models (exit 0: done, the next
+level starts; exit 4: wait 15 minutes and resume, at most 4 times; any other code: stopped, no resume):
+
+```
+node scripts/eval-ab.mjs --model commandcode/deepseek/deepseek-v4.1-flash --thinking low --jev-backend subq --repeats 39 --turns 12 --concurrency 3 --seed 20261001 --timeout-min 1.1 --arc-timeout-min 7.25 --stall-min 15 --jev-usd-cap 3 --out <batch folder, low>
+node scripts/eval-ab.mjs --model commandcode/deepseek/deepseek-v4.1-flash --thinking high --jev-backend subq --repeats 32 --turns 12 --concurrency 3 --seed 20261001 --timeout-min 1.1 --arc-timeout-min 7.25 --stall-min 15 --jev-usd-cap 3 --out <batch folder, high>
+```
+
+A stopped v5 batch continues with `node scripts/eval-ab.mjs --resume <batch folder> --jev-backend subq
+--concurrency 3 --jev-usd-cap 3`; the resumed batch keeps its level, model, seed, and backend, and
+refuses a different value for any of them.
+
+**What v5 changes against v4.** The agent model and provider (`commandcode/deepseek/deepseek-v4.1-flash`
+instead of `cheapestinference/deepseek-v4.1-flash` and `cheapestinference/mimo-v2.5`); one model at two
+thinking levels instead of two models at one level each; the judgment backend (SubQ instead of TypeSafe)
+and its price; the repeats (39 and 32 instead of 6 and 7) and the timeouts (66 s and 435 s instead of
+90 min and 113 min), both from this run's own smoke timings; the launch commands.
+
+**What v5 does not change.** The 20 tasks and their families, the three cells and their one-switch
+difference, the blocks and their seeded cell order (seed 20261001), the resume rule, the
+infrastructure-failure rule with the 15-minute stall rule and the 10% block rule, the Jev-error stop,
+the metrics and their analysis set, the decision rules (a) (b) (c) (d) with their bounds and p-value,
+the power inputs, the $3 Jev cap per batch, and the commit under test.
 
 ## Corrections
 

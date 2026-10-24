@@ -80,11 +80,18 @@
  * (re-runs and a run that fell back included, resumed batches cumulative). At N no new
  * run starts, runs in flight finish, and the script exits with code 3.
  *
+ * Judgment backend: `--jev-backend <name>` (default `typesafe`) writes `typesafeBackend`
+ * into each Jev cell's own pi-warden config and places that backend's key in the run's
+ * own pi-typesafe auth.json, at mode 0600. The key comes from pi-typesafe's store for the
+ * backend, else from the backend's own variable in this process; that variable is dropped
+ * from every child's environment. The run's Jev dollars use the backend's own rate.
+ *
  * Usage:
  *   node scripts/eval-ab.mjs                                  # all tasks, both cells, 1 repeat
  *   node scripts/eval-ab.mjs --repeats 3 --concurrency 6 --model deepseek/deepseek-v4.1-flash
  *   node scripts/eval-ab.mjs --tasks t6-dsn,t7-todo --max-runs 4 --keep
  *   node scripts/eval-ab.mjs --turns 12 --tasks t16-decay      # decay arc, one long session
+ *   node scripts/eval-ab.mjs --tasks t6-dsn --jev-backend subq --model commandcode/deepseek/deepseek-v4.1-flash
  *   node scripts/eval-ab.mjs --resume eval/reports/<batch folder>   # continue a stopped batch
  *   node scripts/eval-ab.mjs --resume eval/reports/<batch folder> --rerun-excluded   # run its excluded blocks once more
  *   node scripts/eval-ab.mjs --suite weak --repeats 2 --typesafe-cap 400 \
@@ -118,6 +125,7 @@ import { tasks, taskById } from "../eval/tasks.mjs";
 import { violations, violationCounts } from "../eval/check.mjs";
 import { buildReport } from "../eval/report.mjs";
 import { filterEnv, filteredNames } from "../eval/env.mjs";
+import { JEV_BACKENDS } from "../eval/config.mjs";
 import { claimAudit, claims, checksRun, finalAssistantText, gitFacts, readSessionEvents, runScript, runTestFile, toolCalls, visibleActions } from "../eval/verify.mjs";
 import { outcomeAxis, wasteAxis } from "../eval/waste.mjs";
 import { jevDollars, jevUsage, runCost } from "../eval/cost.mjs";
@@ -143,6 +151,7 @@ const { values: cli } = parseArgs({
     waste: { type: "string" },
     extension: { type: "string", multiple: true },
     "typesafe-cap": { type: "string" },
+    "jev-backend": { type: "string" },
     "jev-usd-cap": { type: "string" },
     provider: { type: "string" },
     model: { type: "string" },
@@ -161,8 +170,8 @@ const { values: cli } = parseArgs({
 });
 
 /** The flags that define a batch: a resumed batch takes them from its runs.json and refuses a different value. */
-const PLAN_KEYS = ["repeats", "tasks", "suite", "waste", "typesafe-cap", "provider", "model", "thinking", "turns", "seed", "timeout-min", "arc-timeout-min", "stall-min"];
-const PLAN_DEFAULTS = { repeats: "1", suite: "ab", "timeout-min": "12", "stall-min": "15", seed: String(DEFAULT_SEED) };
+const PLAN_KEYS = ["repeats", "tasks", "suite", "waste", "typesafe-cap", "jev-backend", "provider", "model", "thinking", "turns", "seed", "timeout-min", "arc-timeout-min", "stall-min"];
+const PLAN_DEFAULTS = { repeats: "1", suite: "ab", "jev-backend": "typesafe", "timeout-min": "12", "stall-min": "15", seed: String(DEFAULT_SEED) };
 const RESUME_DIR = cli.resume ? resolve(cli.resume) : null;
 let stored = null;
 if (RESUME_DIR) {
@@ -185,8 +194,10 @@ if (RESUME_DIR) {
     process.exit(2);
   }
   for (const key of PLAN_KEYS) {
-    if (cli[key] !== undefined && String(cli[key]) !== String(stored.plan[key])) {
-      console.error(`--resume: --${key} ${cli[key]} differs from the batch's ${stored.plan[key]}; a resumed batch keeps its plan`);
+    // A batch from before a key existed ran with that key's default, so the default is what it must match.
+    const kept = stored.plan[key] ?? PLAN_DEFAULTS[key];
+    if (cli[key] !== undefined && String(cli[key]) !== String(kept)) {
+      console.error(`--resume: --${key} ${cli[key]} differs from the batch's ${kept}; a resumed batch keeps its plan`);
       process.exit(2);
     }
   }
@@ -194,6 +205,12 @@ if (RESUME_DIR) {
 const values = { ...PLAN_DEFAULTS, ...cli };
 if (stored) for (const key of PLAN_KEYS) if (stored.plan[key] !== undefined) values[key] = stored.plan[key];
 const SEED = Number(values.seed);
+// The judgment backend the run's config names, and the key it reads: pi-warden refuses an unknown name on its own.
+const JEV_BACKEND = values["jev-backend"];
+if (!Object.hasOwn(JEV_BACKENDS, JEV_BACKEND)) {
+  console.error(`Unknown --jev-backend ${JEV_BACKEND}. Available: ${Object.keys(JEV_BACKENDS).join(", ")}`);
+  process.exit(2);
+}
 const JEV_USD_CAP = values["jev-usd-cap"] ? Math.max(0, Number(values["jev-usd-cap"])) : null;
 const RETRY_DELAYS = values["retry-delays"] ? values["retry-delays"].split(",").map((s) => Number(s) * 1000) : RETRY_DELAYS_MS;
 if (!Number.isInteger(SEED) || (JEV_USD_CAP !== null && !Number.isFinite(JEV_USD_CAP)) || RETRY_DELAYS.some((ms) => !Number.isFinite(ms) || ms < 0)) {
@@ -356,10 +373,10 @@ async function prepareAgentDir(base, allowance = null, waste = null, consent = t
   for (const f of ["auth.json", "commandcode-models.json", "models.json", "models-store.json"]) {
     if (existsSync(join(GLOBAL_AGENT, f))) await cp(join(GLOBAL_AGENT, f), join(agentDir, f));
   }
-  // pi-typesafe stores its key in <agentDir>/pi-typesafe/auth.json; copy it without logging, and only for a cell that asks Jev.
-  if (consent && existsSync(join(GLOBAL_AGENT, "pi-typesafe", "auth.json"))) {
-    await cp(join(GLOBAL_AGENT, "pi-typesafe", "auth.json"), join(agentDir, "pi-typesafe", "auth.json"));
-  }
+  // pi-typesafe reads a backend's key from <agentDir>/pi-typesafe/auth.json at mode 0600, and only a
+  // cell that asks Jev gets one: an agent in another cell could otherwise turn Jev on by itself, as
+  // 6 `warden-offline` runs of the v4 batch did.
+  if (consent) await placeJevKey(agentDir);
   const settings = {
     defaultProvider: values.provider ?? "commandcode",
     defaultModel: values.model ?? "z-ai/glm-5.3-flash",
@@ -369,10 +386,34 @@ async function prepareAgentDir(base, allowance = null, waste = null, consent = t
   await writeFile(join(agentDir, "settings.json"), JSON.stringify(settings, null, 2));
   await writeFile(join(agentDir, "pi-warden", "config.json"), JSON.stringify({
     typesafe: consent,
+    ...(consent ? { typesafeBackend: JEV_BACKEND } : {}),
     ...(allowance === null ? {} : { maxRequests: Math.max(1, allowance) }),
     ...(waste === null ? {} : { waste: { enabled: waste, tip: waste } }),
   }));
   return agentDir;
+}
+
+/**
+ * The batch's Jev key: pi-typesafe's stored key for the backend, else the backend's own variable in
+ * this process. Read to place it and never logged; undefined when neither source has one, and the
+ * run then judges with no key, which the Jev-error stop reports rather than hides.
+ */
+function jevKey() {
+  const { keyEnv } = JEV_BACKENDS[JEV_BACKEND];
+  try {
+    const stored = JSON.parse(readFileSync(join(GLOBAL_AGENT, "pi-typesafe", "auth.json"), "utf8")).keys?.[JEV_BACKEND];
+    if (typeof stored === "string" && stored.trim()) return stored.trim();
+  } catch { /* no store for this backend: fall through to its own variable */ }
+  const fromEnv = process.env[keyEnv]?.trim();
+  return fromEnv || undefined;
+}
+
+/** Write the run's own auth.json: one backend, one key, mode 0600 (pi-typesafe refuses a key others can read). */
+async function placeJevKey(agentDir) {
+  const key = jevKey();
+  if (!key) return;
+  const path = join(agentDir, "pi-typesafe", "auth.json");
+  await writeFile(path, JSON.stringify({ keys: { [JEV_BACKEND]: key } }), { mode: 0o600 });
 }
 
 function piArgs(cell, sessionDir, extra = []) {
@@ -509,7 +550,7 @@ async function score({ project, sessions, agentDir, baseline, run, checks, dropp
       claimsWithoutRun: audit.unran, violationCount: viols.length,
     }),
     waste: wasteAxis(events, { seconds: run.seconds }),
-    cost: runCost({ events, agentDir, model: values.model ?? "pi default" }),
+    cost: runCost({ events, agentDir, model: values.model ?? "pi default", jevBackend: JEV_BACKEND }),
     git: { commits: facts.commits, subjects: facts.subjects, merges: facts.merges, pushed: facts.pushed, deleted: facts.deleted },
     missingSentinels,
     steerCount: steers.length, steers, holds,
@@ -518,17 +559,32 @@ async function score({ project, sessions, agentDir, baseline, run, checks, dropp
   };
 }
 
+/**
+ * The child's environment and the names dropped from it. A judgment key never reaches a child,
+ * whatever its value looks like: the run's own auth.json is the only copy.
+ */
+function childEnvOf(agentDir) {
+  const env = filterEnv(process.env, { agentDir });
+  const dropped = filteredNames(process.env, { agentDir });
+  for (const { keyEnv } of Object.values(JEV_BACKENDS)) {
+    if (keyEnv in env) {
+      delete env[keyEnv];
+      dropped.push(keyEnv);
+    }
+  }
+  return { env, dropped };
+}
+
 async function runOnce(task, cell, repeat, allowance = null) {
   const dirs = await prepareRunDir(task, allowance, wasteSetting(cell), asksJev(cell));
   const { base, project, agentDir, sessions, baseline } = dirs;
-  const env = filterEnv(process.env, { agentDir });
+  const { env, dropped } = childEnvOf(agentDir);
   env.PI_WARDEN_DB = join(base, "holds.db");
   if (WEAK) sandboxEnv(env, dirs.sandbox);
   // The trace file tells the Jev-error stop when judgments went off (a spend-cap stop leaves nothing in the ledger).
   if (WEAK || asksJev(cell)) env.PI_WARDEN_TRACE_DIR = dirs.traceDir;
   // The day cap lives in the run's own ledger, so it bounds every client the run creates.
   if (allowance !== null) env.PI_TYPESAFE_MAX_REQUESTS_PER_DAY = String(Math.max(1, allowance));
-  const dropped = filteredNames(process.env, { agentDir });
   const checks = task.checks ?? ["test"];
   try {
     const pi = await runPi(project, agentDir, sessions, task.prompt, cell, env, [], TIMEOUT_MS * (task.timeoutScale ?? 1));
@@ -550,12 +606,11 @@ async function runOnce(task, cell, repeat, allowance = null) {
 async function runArc(task, cell, repeat, allowance = null) {
   const dirs = await prepareRunDir(task, allowance, wasteSetting(cell), asksJev(cell));
   const { base, project, agentDir, sessions, baseline } = dirs;
-  const env = filterEnv(process.env, { agentDir });
+  const { env, dropped } = childEnvOf(agentDir);
   env.PI_WARDEN_DB = join(base, "holds.db");
   if (asksJev(cell)) env.PI_WARDEN_TRACE_DIR = dirs.traceDir;
   // The day cap lives in the run's own ledger, so it bounds every client the run creates.
   if (allowance !== null) env.PI_TYPESAFE_MAX_REQUESTS_PER_DAY = String(Math.max(1, allowance));
-  const dropped = filteredNames(process.env, { agentDir });
   const checks = task.checks ?? ["test"];
   const turns = [];
   const prompts = task.arc.slice(0, TURNS || task.arc.length);
@@ -680,6 +735,7 @@ async function main() {
     (values.model ? `, model ${values.model}` : ", pi default model") +
     (TURNS ? `, ${TURNS} turns per run` : "") +
     (TYPESAFE_CAP !== null ? `, TypeSafe cap ${TYPESAFE_CAP}` : "") +
+    `, Jev backend ${JEV_BACKEND}` +
     (JEV_USD_CAP !== null ? `, Jev cap $${JEV_USD_CAP}` : "") +
     (values["dry-run"] ? " (dry run)" : ""));
 
@@ -743,7 +799,7 @@ async function main() {
     const outcome = task.arc && (TURNS || !task.prompt) ? await runArc(task, cell, repeat, allowance) : await runOnce(task, cell, repeat, allowance);
     const { record, pi, base } = outcome;
     const agentDir = join(base, "agent-dir");
-    const jevUsd = jevDollars(jevUsage(agentDir));
+    const jevUsd = jevDollars(jevUsage(agentDir), JEV_BACKEND);
     if (allowance !== null) {
       const judged = record?.weak?.judged ?? allowance;
       allowances.get(runKey(run)).spent += judged;

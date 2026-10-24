@@ -353,10 +353,16 @@ const args = process.argv.slice(2);
 const sessionDir = args[args.indexOf("--session-dir") + 1];
 const warden = args.some((a, i) => args[i - 1] === "-e" && a.endsWith(path.join("extensions", "index.js")));
 const agentDir = process.env.PI_CODING_AGENT_DIR;
+const wardenConfig = warden ? JSON.parse(fs.readFileSync(path.join(agentDir, "pi-warden", "config.json"), "utf8")) : {};
 let cell = "control";
-if (warden) cell = JSON.parse(fs.readFileSync(path.join(agentDir, "pi-warden", "config.json"), "utf8")).typesafe ? "warden" : "warden-offline";
+if (warden) cell = wardenConfig.typesafe ? "warden" : "warden-offline";
 const state = process.env.PI_FAKE_STATE;
-fs.appendFileSync(path.join(state, "keyed.log"), cell + (fs.existsSync(path.join(agentDir, "pi-typesafe", "auth.json")) ? " key" : " no-key") + "\\n");
+const auth = path.join(agentDir, "pi-typesafe", "auth.json");
+fs.appendFileSync(path.join(state, "keyed.log"), cell + (fs.existsSync(auth) ? " key" : " no-key") + "\\n");
+// What the run's agent folder and environment hold: the backend its config names, the key file's
+// mode and ids, and whether a judgment key reached this child's environment.
+const authIds = fs.existsSync(auth) ? Object.keys(JSON.parse(fs.readFileSync(auth, "utf8")).keys || {}).join(",") || "-" : "-";
+fs.appendFileSync(path.join(state, "auth.log"), [cell, wardenConfig.typesafeBackend || "-", fs.existsSync(auth) ? (fs.statSync(auth).mode & 0o777).toString(8) : "-", authIds, process.env.SUBQ_API_KEY === undefined ? "no-subq-env" : "subq-env"].join(" ") + "\\n");
 const bump = (name) => {
   const file = path.join(state, name);
   const n = (fs.existsSync(file) ? Number(fs.readFileSync(file, "utf8")) : 0) + 1;
@@ -416,7 +422,13 @@ function fixture() {
   writeFileSync(join(bin, "pi"), FAKE_PI);
   chmodSync(join(bin, "pi"), 0o755);
   const out = join(root, "report");
-  const env = (extra: Record<string, string>) => ({ ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, PI_FAKE_STATE: stateDir, ...extra });
+  // No judgment key from the operator's own environment reaches a test: a test that needs one passes its own.
+  const env = (extra: Record<string, string> = {}) => {
+    const base: Record<string, string | undefined> = { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, PI_FAKE_STATE: stateDir };
+    delete base.TYPESAFE_API_KEY;
+    delete base.SUBQ_API_KEY;
+    return { ...base, ...extra } as Record<string, string>;
+  };
   const read = () => (existsSync(join(out, "runs.json")) ? JSON.parse(readFileSync(join(out, "runs.json"), "utf8")) : null);
   const starts = () => (existsSync(join(stateDir, "starts.log")) ? readFileSync(join(stateDir, "starts.log"), "utf8").trim().split("\n") : []);
   const go = (args: string[], extra: Record<string, string> = {}) =>
@@ -598,18 +610,57 @@ test("a Jev request in flight when the run's process exits, with no fallback in 
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("only a cell that asks Jev gets the TypeSafe key in its run agent folder", () => {
+test("only a cell that asks Jev gets its backend's key in its run agent folder", () => {
   const f = fixture();
   const home = join(f.root, "home");
   try {
     mkdirSync(join(home, ".pi", "agent", "pi-typesafe"), { recursive: true });
-    writeFileSync(join(home, ".pi", "agent", "pi-typesafe", "auth.json"), '{"key":"fake"}\n');
+    writeFileSync(join(home, ".pi", "agent", "pi-typesafe", "auth.json"), '{"keys":{"typesafe":"fake"}}\n');
     const run = f.go(["--repeats", "1", "--concurrency", "1", "--out", f.out], { HOME: home });
     assert.equal(run.status, 0, run.stdout + run.stderr);
     const keyed = new Map(readFileSync(join(f.root, "fake-state", "keyed.log"), "utf8").trim().split("\n").map((line) => line.split(" ") as [string, string]));
     assert.equal(keyed.get("warden"), "key", "the warden cell asks Jev and gets the key");
     assert.equal(keyed.get("warden-offline"), "no-key", "the offline cell asks Jev nothing and must not get the key");
     assert.equal(keyed.get("control"), "no-key", "the control cell asks Jev nothing and must not get the key");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("the Jev backend flag reaches the run's config and the batch plan, and its key is placed 0600 and kept out of the child", () => {
+  const f = fixture();
+  try {
+    const run = f.go(["--repeats", "1", "--concurrency", "1", "--jev-backend", "subq", "--out", f.out], { SUBQ_API_KEY: "subq-test-key-000000000000" });
+    assert.equal(run.status, 0, run.stdout + run.stderr);
+    assert.match(run.stdout, /Jev backend subq/);
+    assert.equal(f.read().plan["jev-backend"], "subq");
+    const configOf = (cell: string) => JSON.parse(readFileSync(join(f.out, "runs", `t1-redact-${cell}-r1`, "agent-dir", "pi-warden", "config.json"), "utf8"));
+    assert.equal(configOf("warden").typesafeBackend, "subq", "the Jev cell judges through the backend the batch names");
+    assert.equal(configOf("warden-offline").typesafeBackend, undefined, "a cell that asks Jev nothing names no backend");
+    // Each run's own auth.log line: cell, config backend, key mode, key ids, whether SUBQ_API_KEY reached the child.
+    const lines = readFileSync(join(f.root, "fake-state", "auth.log"), "utf8").trim().split("\n").map((line) => line.split(" "));
+    assert.deepEqual(lines.find((l) => l[0] === "warden")!.slice(1), ["subq", "600", "subq", "no-subq-env"]);
+    assert.deepEqual(lines.find((l) => l[0] === "warden-offline")!.slice(2), ["-", "-", "no-subq-env"], "no key in a cell that asks Jev nothing");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a resumed batch keeps its Jev backend, refuses a different one, and a batch from before the flag ran with the default", () => {
+  const f = fixture();
+  const key = { SUBQ_API_KEY: "subq-test-key-000000000000" };
+  try {
+    const first = f.go(["--repeats", "2", "--concurrency", "1", "--seed", "5", "--jev-backend", "subq", "--out", f.out], { ...key, PI_FAKE_INTERRUPT_AT: "4" });
+    assert.equal(first.status, 130, first.stdout + first.stderr);
+    assert.equal(f.read().plan["jev-backend"], "subq");
+    const same = f.go(["--resume", f.out, "--concurrency", "1", "--jev-backend", "subq"], key);
+    assert.equal(same.status, 0, same.stdout + same.stderr);
+    assert.equal(f.read().plan["jev-backend"], "subq", "the resumed batch still records its backend");
+    const wrong = f.go(["--resume", f.out, "--jev-backend", "typesafe"]);
+    assert.equal(wrong.status, 2);
+    assert.match(wrong.stderr, /--jev-backend typesafe differs from the batch's subq/);
+    // A plan written before the flag existed has no value for it, so the flag's default is what it ran with.
+    const doc = f.read();
+    delete doc.plan["jev-backend"];
+    writeFileSync(join(f.out, "runs.json"), JSON.stringify(doc));
+    const legacy = f.go(["--resume", f.out, "--jev-backend", "typesafe"]);
+    assert.equal(legacy.status, 0, legacy.stdout + legacy.stderr);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
