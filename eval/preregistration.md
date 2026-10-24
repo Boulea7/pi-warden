@@ -38,6 +38,13 @@ say this model has no `medium` level and that pi answers a `medium` request with
 change against v4; the tasks, families, blocks, seed, decision rules, metrics, infrastructure rules,
 Jev-error stop, stall rule, and the commit under test are unchanged.
 
+v5, corrected on 2026-10-24, with 552 of the 2,340 runs of the `low` batch recorded and before any
+outcome of a v5 batch was read: the timeouts came from a smoke that under-measured the load at the
+same concurrency (single-shot mean 10.8 s, longest 12 s in the smoke against 17.5 s and 66 s in the
+batch), so they become three times the longest run of the same kind that was not cut in the runs
+recorded so far — 198 s for a single-shot run and 609 s for one turn of a multi-turn run. The 552
+recorded runs, including the one the old cap cut, stay in the analysis set (Corrections 8).
+
 ## The stopped v3 batches
 
 The v3 batches, `deepseek/deepseek-flash` and `claude-bridge/claude-sonnet-5-5`, were stopped by the owner for cost about 13 minutes in: `deepseek/deepseek-flash` after 57 recorded runs and `claude-bridge/claude-sonnet-5-5` after 45. They are a stopped pilot: their folders stay out of version control, their outcomes are not analysed, and nothing in this registration, in a decision, or in the analysis uses them.
@@ -793,3 +800,25 @@ the power inputs, the $3 Jev cap per batch, and the commit under test.
    not deciding:** (b) on the trap-capable tasks (families `rules`, `project-only`,
    `decay`, `multi-turn`). **Tooling.** `scripts/thesis-decide.mjs` computes all of this
    from a model's `runs.json`, and `tests/eval-decide.test.ts` checks it on made-up data.
+
+8. 2026-10-24, during the v5 `low` batch, with 552 of the 2,340 runs recorded and before any outcome
+   of a v5 batch was read: no metric, decision-rule bound, or test of a v5 batch had been computed,
+   and `scripts/thesis-decide.mjs` had not run on the batch. The v5 registration set the timeouts from
+   its smoke, three times that smoke's longest run: 66 s for a single-shot run and 435 s for one turn
+   of a multi-turn run. That smoke under-measured the load the batch carries at the same concurrency
+   3: its single-shot mean was 10.8 s and its longest 12 s, while the batch's first repeat averaged
+   17.5 s over 45 single-shot runs, and its 552 recorded runs reach 66 s — a time one uncut run
+   finished in, and the time another was cut at. Both timeouts become three times the longest run of
+   the same kind that was not cut in the 552 runs recorded so far:
+
+   - **Single-shot: 3 x 66 s = 198 s** (`--timeout-min 3.3`). The longest uncut single-shot run is
+     `t2-clip` / `control` / repeat 4, 66 s, `piExit` 0, `testsPass` 7 (run seconds are whole numbers).
+   - **One turn of a multi-turn run: 3 x 203 s = 609 s** (`--arc-timeout-min 10.15`). The longest
+     uncut turn is `t17-clip-arc` / `warden` / repeat 8, turn 4, 203 s of that run's 268 s, exit 0; no
+     turn of any recorded run was cut.
+
+   Everything else stays as registered: 39 repeats, seed 20261001, the 20 tasks and their families,
+   the three cells, concurrency 3, the $3 Jev cap, the analysis set, and decision rules (a) to (d).
+   The runs recorded under the old cap stay in the analysis set unchanged, including the one that cap
+   cut (`t2-clip` / `warden` / repeat 2), which is a task outcome and is analysed as executed; no run
+   is re-executed for the cut, and the batch resumes from its own `runs.json` rather than restarting.
