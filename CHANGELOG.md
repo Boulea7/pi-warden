@@ -8,6 +8,21 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 <!-- Empty. Next release starts here. -->
 
+## 2.2.0
+
+### Added
+
+- An unverified completion claim leaves one dim `pi-warden · done-check · …` line under the reply in the transcript, as a custom session entry the model never sees.
+
+### Changed
+
+- The done-check keeps its change-and-check ledger for the session, so a check that passed in an earlier turn still covers a change no later turn touched; a new, reloaded, resumed, or forked session starts empty.
+- `done.nudge` now gates that line under the reply. No key changed and the agent still gets no follow-up turn.
+
+### Fixed
+
+- `/warden status` no longer counts done notices as steers whose outcome was "followed", which was coincidence once no text reaches the agent.
+
 ## 2.1.0
 
 ### Changed
