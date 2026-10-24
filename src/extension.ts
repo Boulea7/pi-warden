@@ -1296,6 +1296,9 @@ export default function wardenExtension(host: ExtensionAPI): void {
     unsubscribeTraceFile?.();
     unsubscribeTraceFile = undefined;
     traceFile = undefined;
+    // A superseded file can be sent no more lines, so once the ones it queued land it is dropped: a long run keeps the
+    // files that still owe writes, not one per session.
+    for (const retired of traceFiles) retired.flush().then(() => { traceFiles = traceFiles.filter(kept => kept !== retired); });
     judgmentsReported.clear();
     judgmentsHeadless = !ctx.hasUI;
     judgmentsNotify = text => { warnOwner(ctx, "notice", text); };
@@ -1326,11 +1329,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
         await Promise.all([...logTails, ...traceTails]);
         const traceMoved = files.some((file, index) => traceTails[index] !== file.flush());
         const logGrew = [...holdLogWrites].some(write => !logTails.includes(write));
-        if (!traceMoved && !logGrew) {
-          // An earlier session's file is unlistened and owes nothing, so it is dropped: a long run keeps one file.
-          traceFiles = traceFile ? [traceFile] : [];
-          return;
-        }
+        if (!traceMoved && !logGrew) return;
       }
     };
     arming.reset();
