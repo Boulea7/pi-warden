@@ -8,6 +8,13 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 <!-- Empty. Next release starts here. -->
 
+## 2.2.2
+
+### Fixed
+
+- A report read right after a command could come back empty once the session had switched: the read now waits for every trace file and hold-log write the run queued, not only the current session's, and a superseded trace file is dropped as soon as its queued lines land.
+- The test flush and trace-writer seams now reach the running extension. A test process loads the extension twice, so a module variable never carried them, and the wait added in 2.2.1 never ran in tests.
+
 ## 2.2.1
 
 ### Changed

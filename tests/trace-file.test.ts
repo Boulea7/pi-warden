@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { Trace } from "../src/trace.js";
 import type { TraceEntry } from "../src/trace.js";
-import { TraceFile, judgmentsState, traceDir, traceFilePath } from "../src/trace-file.js";
+import { TraceFile, _testSetTraceWriter, judgmentsState, traceDir, traceFilePath } from "../src/trace-file.js";
 
 let temporary: string;
 before(async () => { temporary = await mkdtemp(join(tmpdir(), "pi-warden-trace-file-")); });
@@ -120,4 +120,27 @@ test("a failure after the file opened is also reported once", async () => {
   await file.flush();
   assert.equal(failures.length, 1);
   assert.deepEqual((await lines(path)).map(record => record.kind), ["session"]);
+});
+
+test("flush stays pending while a write is open and resolves once it lands", async () => {
+  const dir = join(temporary, "held");
+  const path = traceFilePath(dir, "held");
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  _testSetTraceWriter(async (target, text) => { await gate; await appendFile(target, text, { mode: 0o600 }); });
+  try {
+    const trace = new Trace();
+    const file = new TraceFile(path, dir, { sessionId: "held", cwd: "/w", mode: "steer", judgments: "on" }, () => assert.fail("no failure"));
+    trace.subscribe(file.listener);
+    trace.push(entry("held line"));
+    let settled = false;
+    const flush = file.flush().then(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false, "the queue is still open, so the flush is not done");
+    release();
+    await flush;
+    assert.deepEqual((await lines(path)).map(record => record.kind), ["session", "entry"], "the released line is on disk when flush resolves");
+  } finally {
+    _testSetTraceWriter(undefined);
+  }
 });

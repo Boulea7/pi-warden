@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, realpathSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -15,6 +15,7 @@ import { defaultConfig, loadConfig, loosenRecordPath } from "../src/config.js";
 import { doneNoteLine, DONE_NOTE_TYPE, type DoneNote } from "../src/done.js";
 import { policyMatches, CONSCIENCE_BETA_POLICY } from "../src/load.js";
 import { _testFlushWrites, _testSetIndexRunning, askedBeforeReply, assistantPlan } from "../src/extension.js";
+import { _testSetTraceWriter } from "../src/trace-file.js";
 import { SHELL_RULES_CHECKS } from "../src/turn-rules.js";
 import { indexPath, readIndex } from "../src/index-cmd.js";
 
@@ -398,6 +399,45 @@ test("a report a headless command makes is readable as soon as the command retur
   for (let made = 1; made <= 24; made++) {
     await runCommand("status", context({ hasUI: false }));
     assert.equal((await shownNotices()).length, made, `report ${made} is on disk when the read returns`);
+  }
+});
+
+/**
+ * A session switch opens a new TraceFile and stops listening to the old one, but the session before it can still owe
+ * lines to the same file. The flush used to wait only for the newest file, so a read right after the switch came back
+ * empty on the release gate; it now waits for every file the run has open, and this holds one write open to prove it.
+ */
+test("a read waits for the write an earlier session queued, not only the current session's", async () => {
+  await grantConsent();
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  let holdNext = false;
+  let headers = 0;
+  let newFileOpened!: () => void;
+  const opened = new Promise<void>(resolve => { newFileOpened = resolve; });
+  _testSetTraceWriter(async (path, text) => {
+    // Only the status line is held. The new session's writes, its header included, go straight through, so nothing of
+    // its own is outstanding when the flush is checked.
+    if (text.includes('"kind":"session"') && ++headers === 2) newFileOpened();
+    if (holdNext) { holdNext = false; await held; }
+    appendFileSync(path, text, { mode: 0o600 });
+  });
+  try {
+    await _testFlushWrites();
+    holdNext = true;
+    await runCommand("status", context({ hasUI: false }));
+    await fire("session_start", {}, context());
+    await opened;
+    await new Promise(resolve => setImmediate(resolve));
+    let settled = false;
+    const flush = _testFlushWrites().then(() => { settled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(settled, false, "the flush waits for the file the earlier session queued on");
+    release();
+    await flush;
+    assert.match(await readFile(traceLog(), "utf8"), /"line":"pi-warden: (guarding|off) /, "the status line the earlier session queued is on disk when the read returns");
+  } finally {
+    _testSetTraceWriter(undefined);
   }
 });
 
