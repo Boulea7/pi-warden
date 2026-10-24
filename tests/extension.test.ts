@@ -14,7 +14,7 @@ import { readRulesLog, rulesLogPath } from "../src/rules-log.js";
 import { defaultConfig, loadConfig, loosenRecordPath } from "../src/config.js";
 import { doneNoteLine, DONE_NOTE_TYPE, type DoneNote } from "../src/done.js";
 import { policyMatches, CONSCIENCE_BETA_POLICY } from "../src/load.js";
-import { _testSetIndexRunning, askedBeforeReply, assistantPlan } from "../src/extension.js";
+import { _testFlushWrites, _testSetIndexRunning, askedBeforeReply, assistantPlan } from "../src/extension.js";
 import { SHELL_RULES_CHECKS } from "../src/turn-rules.js";
 import { indexPath, readIndex } from "../src/index-cmd.js";
 
@@ -73,6 +73,9 @@ interface RecordedEntry { at: number; guard: string; line: string; details: stri
 /** Every trace entry the extension wrote since this test began; the trace is where a report goes now. */
 const recordedSince = async (): Promise<RecordedEntry[]> => {
   const read = async (): Promise<RecordedEntry[]> => {
+    // The extension writes the trace after it reports, one queued write at a time; its own promise says when the queue
+    // is empty, so this read never answers from a file that is still a write behind on a slow or loaded machine.
+    await _testFlushWrites();
     const raw = await readFile(traceLog(), "utf8").catch(() => "");
     return raw.slice(0, raw.lastIndexOf("\n") + 1).split("\n").filter(Boolean)
       .map(line => JSON.parse(line) as Record<string, unknown>)
@@ -80,7 +83,8 @@ const recordedSince = async (): Promise<RecordedEntry[]> => {
       .map(record => ({ at: Date.parse(String(record.at)), guard: String(record.guard), line: String(record.line ?? ""), details: (record.details as string[] | undefined) ?? [] }))
       .filter(entry => entry.at >= testStartedAt);
   };
-  // Two reads that agree have seen the queue settle.
+  // Two reads that agree have seen the queue settle; the flush above already waited for the writes themselves, so the
+  // loop only gives a judgment still in flight the moment it needs to land.
   let previous = await read();
   for (let attempt = 0; attempt < 40; attempt++) {
     await new Promise(resolve => setTimeout(resolve, 10));
@@ -376,7 +380,25 @@ after(async () => {
   if (savedEnabled === undefined) delete process.env.PI_WARDEN_ENABLED; else process.env.PI_WARDEN_ENABLED = savedEnabled;
   if (savedMode === undefined) delete process.env.PI_WARDEN_MODE; else process.env.PI_WARDEN_MODE = savedMode;
   if (savedDb === undefined) delete process.env.PI_WARDEN_DB; else process.env.PI_WARDEN_DB = savedDb;
-  if (temporary) await rm(temporary, { recursive: true, force: true });
+  if (temporary) {
+    // A hold-log write a stray continuation queues after the last session still lands in this tree, so the removal is
+    // the one Node retries: `rm` treats ENOTEMPTY as a directory being modified, and removing it again is idempotent.
+    await _testFlushWrites();
+    await rm(temporary, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  }
+});
+
+/**
+ * The extension writes the trace after it reports it, one queued write at a time, so a read that only compares two
+ * counts can answer from a file that is still a write behind: that is the empty or previous notice the release gate
+ * failed on. The reader waits for the session's own write promise instead, so every report is readable at once.
+ */
+test("a report a headless command makes is readable as soon as the command returns", async () => {
+  await grantConsent();
+  for (let made = 1; made <= 24; made++) {
+    await runCommand("status", context({ hasUI: false }));
+    assert.equal((await shownNotices()).length, made, `report ${made} is on disk when the read returns`);
+  }
 });
 
 test("the observer records one five-question request without rootId and never claims", async () => {

@@ -376,6 +376,14 @@ export function _testSetIndexRunning(running: boolean, paths: string[] = []): vo
   indexWritePaths = paths;
 }
 
+/** Set by the running extension: resolves once every write its session has queued is on disk. */
+let flushSessionWrites: (() => Promise<void>) | undefined;
+/** Test-only: the session's own promise for its pending writes, so a test that reads a file waits for it rather than
+ *  guessing how long a write takes on the machine it runs on. */
+export function _testFlushWrites(): Promise<void> {
+  return flushSessionWrites?.() ?? Promise.resolve();
+}
+
 
 /* ─── One-time migration notice ─────────────────────────────────────── */
 
@@ -523,6 +531,8 @@ export default function wardenExtension(host: ExtensionAPI): void {
   }
   const traceOf = new WeakMap<CallRecord, TraceEntry>();
   let holdLog: HoldLog | undefined;
+  /** The last hold-log write the session queued; it outlives the session that asked for it, so the next one waits. */
+  let holdLogWrite: Promise<void> = Promise.resolve();
   /** The session id of the open session; every hold row of it carries it. */
   let activeSessionId: string | undefined;
   /** The id guards key session state by: the host's, or this process when the host gives none. */
@@ -1039,7 +1049,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
         idPromise.then(id => recordOutcome(id, item.outcome, dirs)).catch(err => console.warn("pi-warden: recordOutcome failed:", err));
       }
     }
-    if (config.action.feedbackLog && holds.records().length) void holdLog?.save(holds.records());
+    if (config.action.feedbackLog && holds.records().length) holdLogWrite = holdLog?.save(holds.records()) ?? holdLogWrite;
   };
   /** The user's reply was read for regret, by Jev or by the offline heuristic; the candidates are labelled once. */
   const settleRegret = (config: WardenConfig, result: { regretted: boolean; target?: string | undefined; probability?: number | undefined; via: OutcomeVia }) => {
@@ -1261,7 +1271,10 @@ export default function wardenExtension(host: ExtensionAPI): void {
     const sessionId = typeof ctx.sessionManager.getSessionId === "function" ? ctx.sessionManager.getSessionId() : String(process.pid);
     activeSessionId = sessionId;
     trialArm = "live";
+    // A save the session that just ended queued can still land; it must be on disk before this one writes the same file.
+    await holdLogWrite;
     holdLog = new HoldLog(holdLogPath(sessionId, new Date(), dirs));
+    holdLogWrite = Promise.resolve();
     rulesLog = new RulesLog(ctx.cwd, sessionId, { path: rulesLogPath(ctx.cwd, dirs), onFailure: message => record(ctx, sessionUserConfig(), "rules", "rules log write failed", [message]) });
     unsubscribeTraceFile?.();
     unsubscribeTraceFile = undefined;
@@ -1284,6 +1297,17 @@ export default function wardenExtension(host: ExtensionAPI): void {
       traceFile = new TraceFile(traceFilePath(dir, sessionId), dir, { sessionId, cwd: ctx.cwd, mode: opening.mode, judgments: judgmentsState(judgmentsOffReason(opening)) }, warn);
       unsubscribeTraceFile = trace.subscribe(traceFile.listener);
     }
+    flushSessionWrites = async () => {
+      // A write queued while an earlier one is still finishing chains onto it, so the queue is drained rather than sampled:
+      // the tail moving again means another write arrived, and its promise is the one to wait on.
+      for (let round = 0; round < 10; round++) {
+        const logTail = holdLogWrite;
+        const traceTail = traceFile?.flush();
+        await logTail;
+        await traceTail;
+        if (logTail === holdLogWrite && traceTail === traceFile?.flush()) return;
+      }
+    };
     arming.reset();
     attempts.reset();
     waste.reset();

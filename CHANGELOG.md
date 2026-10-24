@@ -8,6 +8,16 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 <!-- Empty. Next release starts here. -->
 
+## 2.2.1
+
+### Changed
+
+- A new session waits for the hold-log write the previous session queued before it writes the same file.
+
+### Fixed
+
+- A test read the trace after comparing two entry counts, which can agree while a queued write is still pending; on a slow runner a guard's notice then read back as missing or stale and the release check failed at random. The read now waits for the session's own write promise, and the test file's cleanup no longer races a pending hold-log write.
+
 ## 2.2.0
 
 ### Added
