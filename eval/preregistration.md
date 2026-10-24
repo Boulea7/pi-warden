@@ -34,7 +34,7 @@ commandcode subscription, one model at two thinking levels, `commandcode/deepsee
 at `low` and then at `high`, one batch per level, run one after the other; judgments go to SubQ instead
 of TypeSafe and are priced at SubQ's own rate. The owner asked for `medium` and `high`; two measurements
 say this model has no `medium` level and that pi answers a `medium` request with `high`, so `low` and
-`high` are registered and the owner confirms that pair before launch. "The v5 run" below states every
+`high` are registered, and the owner confirmed that pair on 2026-10-24. "The v5 run" below states every
 change against v4; the tasks, families, blocks, seed, decision rules, metrics, infrastructure rules,
 Jev-error stop, stall rule, and the commit under test are unchanged.
 
@@ -427,7 +427,7 @@ the thinking levels `off`, `low`, `high`, `max`
 (`node_modules/pi-commandcode-provider/src/commandcode-catalog.ts`, read 2026-10-24), with no `medium`;
 and a real run at `--thinking medium` records `{"type":"thinking_level_change","thinkingLevel":"high"}`
 in its session log, so pi answers `medium` with `high` and a `medium` batch would be a second `high`
-batch. `low` and `high` are registered in that order, pending the owner's confirmation of the pair.
+batch. `low` and `high` are registered in that order, and the owner confirmed that pair on 2026-10-24.
 
 **Smoke timings** (`PI_MODEL` and `PI_REASONING_LEVEL` read back from every run's session log;
 timings and cost only — no outcome was read, and these runs are not evidence, per "Not evidence").
