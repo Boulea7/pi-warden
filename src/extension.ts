@@ -376,12 +376,16 @@ export function _testSetIndexRunning(running: boolean, paths: string[] = []): vo
   indexWritePaths = paths;
 }
 
-/** Set by the running extension: resolves once every write its session has queued is on disk. */
-let flushSessionWrites: (() => Promise<void>) | undefined;
-/** Test-only: the session's own promise for its pending writes, so a test that reads a file waits for it rather than
+/**
+ * Test-only, on globalThis: the test process loads this module twice (Pi's loader beside the test's own import), so a
+ * module variable cannot carry the flush from the running session to `_testFlushWrites`.
+ */
+const testFlushKey = Symbol.for("pi-warden.test.flushWrites");
+/** Test-only: resolves once every write the run has queued is on disk, so a test reads a settled file rather than
  *  guessing how long a write takes on the machine it runs on. */
 export function _testFlushWrites(): Promise<void> {
-  return flushSessionWrites?.() ?? Promise.resolve();
+  const flush = (globalThis as Record<symbol, unknown>)[testFlushKey];
+  return typeof flush === "function" ? (flush as () => Promise<void>)() : Promise.resolve();
 }
 
 
@@ -452,6 +456,11 @@ export default function wardenExtension(host: ExtensionAPI): void {
   const trace = new Trace();
   // The trace file for a host without the terminal UI; set per session when PI_WARDEN_TRACE_DIR is an absolute path.
   let traceFile: TraceFile | undefined;
+  // Every trace file this run opened, newest last. A session switch stops listening to the old file, but its queued
+  // lines are still owed to disk, and a read right after the switch must not come back a write behind.
+  let traceFiles: TraceFile[] = [];
+  // Every hold-log write this run still owes to disk, so a switch waits for the save the session before it made.
+  const holdLogWrites = new Set<Promise<void>>();
   let unsubscribeTraceFile: (() => void) | undefined;
   // Directories outside the project the host lets its agent write; set per session from PI_WARDEN_HOST_PATHS.
   let sessionHostPaths: string[] = [];
@@ -1049,7 +1058,15 @@ export default function wardenExtension(host: ExtensionAPI): void {
         idPromise.then(id => recordOutcome(id, item.outcome, dirs)).catch(err => console.warn("pi-warden: recordOutcome failed:", err));
       }
     }
-    if (config.action.feedbackLog && holds.records().length) holdLogWrite = holdLog?.save(holds.records()) ?? holdLogWrite;
+    if (config.action.feedbackLog && holds.records().length) {
+      const write = holdLog?.save(holds.records());
+      if (write) {
+        const landed = () => { holdLogWrites.delete(write); };
+        write.then(landed, landed);
+        holdLogWrites.add(write);
+        holdLogWrite = write;
+      }
+    }
   };
   /** The user's reply was read for regret, by Jev or by the offline heuristic; the candidates are labelled once. */
   const settleRegret = (config: WardenConfig, result: { regretted: boolean; target?: string | undefined; probability?: number | undefined; via: OutcomeVia }) => {
@@ -1295,17 +1312,25 @@ export default function wardenExtension(host: ExtensionAPI): void {
       const warn = (text: string) => { warnOwner(ctx, "notice", text); };
       const opening = sessionUserConfig();
       traceFile = new TraceFile(traceFilePath(dir, sessionId), dir, { sessionId, cwd: ctx.cwd, mode: opening.mode, judgments: judgmentsState(judgmentsOffReason(opening)) }, warn);
+      traceFiles.push(traceFile);
       unsubscribeTraceFile = trace.subscribe(traceFile.listener);
     }
-    flushSessionWrites = async () => {
-      // A write queued while an earlier one is still finishing chains onto it, so the queue is drained rather than sampled:
-      // the tail moving again means another write arrived, and its promise is the one to wait on.
+    // Every write this run has queued, readable by a test through `_testFlushWrites`.
+    (globalThis as Record<symbol, unknown>)[testFlushKey] = async () => {
+      // A write queued while an earlier one is still finishing chains onto it, so a queue is drained rather than sampled: a
+      // tail that moved again means another write arrived, and its promise is the one to wait on.
       for (let round = 0; round < 10; round++) {
-        const logTail = holdLogWrite;
-        const traceTail = traceFile?.flush();
-        await logTail;
-        await traceTail;
-        if (logTail === holdLogWrite && traceTail === traceFile?.flush()) return;
+        const logTails = [...holdLogWrites];
+        const files = traceFiles;
+        const traceTails = files.map(file => file.flush());
+        await Promise.all([...logTails, ...traceTails]);
+        const traceMoved = files.some((file, index) => traceTails[index] !== file.flush());
+        const logGrew = [...holdLogWrites].some(write => !logTails.includes(write));
+        if (!traceMoved && !logGrew) {
+          // An earlier session's file is unlistened and owes nothing, so it is dropped: a long run keeps one file.
+          traceFiles = traceFile ? [traceFile] : [];
+          return;
+        }
       }
     };
     arming.reset();

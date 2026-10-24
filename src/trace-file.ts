@@ -80,6 +80,25 @@ export function judgmentsState(reason: JudgmentsOffReason | undefined): Judgment
   return reason === undefined ? "on" : `off:${reason}`;
 }
 
+/** Test-only stand-in for `appendFile`: a test holds one write open to prove a reader waits for it. */
+type TraceWrite = (path: string, text: string) => Promise<void>;
+
+/**
+ * On globalThis, not in a module variable: the test process loads this module twice (Pi's loader beside the test's own
+ * import), and a writer the test installs has to reach the copy the running extension writes through.
+ */
+const traceWriterKey = Symbol.for("pi-warden.test.traceWriter");
+
+export function _testSetTraceWriter(write?: TraceWrite): void {
+  if (write) (globalThis as Record<symbol, unknown>)[traceWriterKey] = write;
+  else delete (globalThis as Record<symbol, unknown>)[traceWriterKey];
+}
+
+function append(path: string, text: string): Promise<void> {
+  const write = (globalThis as Record<symbol, unknown>)[traceWriterKey] as TraceWrite | undefined;
+  return write ? write(path, text) : appendFile(path, text, { mode: 0o600 });
+}
+
 /** Appends the session's trace events in trace order, one write at a time. */
 export class TraceFile {
   private queue: Promise<void> = Promise.resolve();
@@ -95,7 +114,7 @@ export class TraceFile {
     this.queue = this.guarded(async () => {
       await mkdir(dir, { recursive: true, mode: 0o700 });
       this.base = await lastEntryId(path);
-      await appendFile(path, `${JSON.stringify(header)}\n`, { mode: 0o600 });
+      await append(path, `${JSON.stringify(header)}\n`);
     });
   }
 
@@ -131,7 +150,7 @@ export class TraceFile {
   }
 
   private append(record: () => Record<string, unknown>): void {
-    this.queue = this.guarded(() => appendFile(this.path, `${JSON.stringify(record())}\n`, { mode: 0o600 }));
+    this.queue = this.guarded(() => append(this.path, `${JSON.stringify(record())}\n`));
   }
 
   private guarded(write: () => Promise<void>): Promise<void> {
