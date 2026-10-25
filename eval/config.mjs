@@ -23,6 +23,13 @@
  *   The v5 run's model, `commandcode/deepseek/deepseek-v4.1-flash`, is the same model
  *   as A on the commandcode subscription, so it is priced as an equivalent the same
  *   way (see `PRICES`).
+ *   The v5 `high` batch's second route (eval/preregistration.md, Correction 11),
+ *   `river/deepseek-ai/DeepSeek-V4.1-Flash-1017`, bills per token at River's own
+ *   published flat rates, which the route's provider catalog carries.
+ *
+ * A dollar figure is per route, never a comparison across routes: one model on two
+ * routes is the same model's tokens at each route's own rates, so a route's dollars
+ * say what that route charged for the work, not which route costs less.
  *
  * The cost axis reads agent tokens from the run's session log and Jev tokens from
  * the run's own pi-typesafe usage ledger, so a per-run dollar figure is
@@ -37,6 +44,7 @@ export const PRICE_SOURCES = {
   holidays: "General Office of the State Council of China, notice on the 2026 public holiday arrangements (国办发明电〔2025〕7号, 2025-11-04): https://www.gov.cn/gongbao/2025/issue_12406/202511/content_7048922.html",
   typesafeJev: "TypeSafe's rate as pi-typesafe's own $/MTok default (DEFAULT_USD_PER_MTOK in node_modules/pi-typesafe/dist/usage.js, read 2026-10-24)",
   subqJev: "pi-typesafe's backend registry (node_modules/pi-typesafe/dist/backends.js, read 2026-10-24): SubQ `subq-snap-preview` at $0.05 per 1M input tokens",
+  river: "River's published flat rates as the route's provider catalog carries them (the River extension's model entry, `cost: { input, output, cacheRead, cacheWrite }`, read 2026-10-25; that entry cites https://docs.river.ai/guides/inference-models/)",
 };
 
 /**
@@ -90,6 +98,13 @@ const half = (rates) => Object.fromEntries(Object.entries(rates).map(([k, v]) =>
  */
 const MIMO_V25 = { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0.14 };
 
+/**
+ * River's flat rate for DeepSeek V4.1 Flash, per 1M tokens: 0.12 in, 0.48 out, 0.0024
+ * cache-read, no cache-write charge. River bills one rate whatever the hour, so unlike
+ * the DeepSeek-billed entries this one needs no window function and no holiday calendar.
+ */
+const RIVER_DEEPSEEK_FLASH = { input: 0.12, output: 0.48, cacheRead: 0.0024, cacheWrite: 0 };
+
 /** Agent prices per 1M tokens: input, output, cacheRead, cacheWrite. */
 export const PRICES = {
   // The CheapestInference subscription bills nothing per token, so the two models served
@@ -118,6 +133,13 @@ export const PRICES = {
     source: PRICE_SOURCES.deepseek,
     holidaySource: PRICE_SOURCES.holidays,
     billed: false,
+  },
+  // The v5 high batch's second route (preregistration, Correction 11): River publishes a flat
+  // per-token rate for this model, so no equivalent is needed and no hour changes it.
+  "river/deepseek-ai/DeepSeek-V4.1-Flash-1017": {
+    flat: RIVER_DEEPSEEK_FLASH,
+    source: PRICE_SOURCES.river,
+    billed: true,
   },
   "deepseek/deepseek-flash": {
     peak: DEEPSEEK_FLASH_PEAK,

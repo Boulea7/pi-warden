@@ -19,7 +19,7 @@ export interface PriceEntry {
   billed: boolean;
 }
 
-export const PRICE_SOURCES: { deepseek: string; anthropic: string; xiaomi: string; holidays: string; typesafeJev: string; subqJev: string };
+export const PRICE_SOURCES: { deepseek: string; anthropic: string; xiaomi: string; holidays: string; typesafeJev: string; subqJev: string; river: string };
 export const CHINESE_HOLIDAYS: Record<number, [string, string][]>;
 export const PRICES: Record<string, PriceEntry>;
 export interface JevBackend {
