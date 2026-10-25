@@ -1,2 +1,5 @@
 # Run evidence stays local: session logs and tool output, too heavy and not needed to reproduce.
 */runs/
+
+# The parsed run data of a batch is as heavy as its run trees; read it where the batch ran.
+*/runs.json
