@@ -56,6 +56,12 @@ any outcome of a v5 `high` batch was read: both run timeouts move to 20 minutes,
 the stall rule nothing to recognize. The 391 recorded runs leave the analysis set and the `high` batch
 restarts in a new folder (Corrections 10).
 
+v5, corrected on 2026-10-25, with 245 of the 1,920 runs of the `high-b` batch recorded and before any
+outcome of a `high-c` batch was read: the Commandcode route refused five calls in a row with its own
+weekly-quota 429 (reset 2026-10-28T09:19:08.820Z), so the `high` batch restarts on the River route in
+a new folder with no registered number changed, and the 245 recorded runs stay on disk as evidence
+(Corrections 11).
+
 ## The stopped v3 batches
 
 The v3 batches, `deepseek/deepseek-flash` and `claude-bridge/claude-sonnet-5-5`, were stopped by the owner for cost about 13 minutes in: `deepseek/deepseek-flash` after 57 recorded runs and `claude-bridge/claude-sonnet-5-5` after 45. They are a stopped pilot: their folders stay out of version control, their outcomes are not analysed, and nothing in this registration, in a decision, or in the analysis uses them.
@@ -869,3 +875,68 @@ the power inputs, the $3 Jev cap per batch, and the commit under test.
    the `high` batch restarts from zero in `eval/reports/2026-10-25-thesis-v5-high-b`. Everything else
    stays as registered: 32 repeats, seed 20261001, the 20 tasks and their families, the three cells,
    concurrency 3, the $3 Jev cap, the analysis set, and decision rules (a) to (d).
+
+11. 2026-10-25, with 245 of the 1,920 runs of the v5 `high-b` batch recorded and before any outcome
+   of a `high-c` batch was read (no metric, bound or test of a `high-c` batch had been computed).
+
+   **The stop.** The Commandcode route refused five agent-model calls in a row with its own 429 body.
+   Those five are the `stoppedBy.failures` of `eval/reports/2026-10-25-thesis-v5-high-b/runs.json`, as
+   the harness stores them (it keeps the first 231 characters of the body):
+
+   > `agent model API error: commandcode API error (429): {"message":"You've reached your weekly usage
+   > limit for your plan. Your limit resets at 2026-10-28T09:19:08.820Z. Please wait for the window to
+   > reset or upgrade your plan t`
+
+   The five are `t3-swallow`/`warden`/repeat 5, `t4-stub`/`warden-offline`/repeat 5,
+   `t5-hermetic`/`warden`/repeat 5, and (each with a `turn 1:` prefix) `t16-decay`/`control`/repeat 4,
+   `t20-ship-arc`/`warden-offline`/repeat 4 and `t20-ship-arc`/`control`/repeat 4. Five infrastructure
+   failures in a row stop the batch, as registered ("Infrastructure failures"), so the batch stopped
+   with 245 runs of 1,920 recorded. Nothing else was wrong with those 245: `timedOut` is false in every
+   one of them, not one recovered a provider error, and every one has `piExit` 0. The quota is weekly:
+   the route cannot run again before 2026-10-28T09:19:08Z, three days after the stop.
+
+   **Why the batch restarts instead of resuming.** The harness freezes a batch's plan in the batch's
+   own record and a resumed batch keeps its plan's model; a resume that names another model is refused
+   rather than mixed in. Correction 10's caps therefore cannot reach a resumed `high-b` either, so the
+   rule of Corrections 9 and 10 holds again: the 245 recorded runs leave the analysis set, stay on disk
+   untouched as evidence in `eval/reports/2026-10-25-thesis-v5-high-b`, and one clean batch carries one
+   protocol.
+
+   **What changes: the route only.** The `high` batch runs model B as
+   `river/deepseek-ai/DeepSeek-V4.1-Flash-1017` through the River provider extension, in
+   `eval/reports/2026-10-25-thesis-v5-high-c`. The provider extension is named on every launch and
+   every resume, because the extension list is not part of a batch's stored plan.
+
+   **What does not change.** 32 repeats, seed 20261001, the same 20 tasks and their families, the three
+   cells (`control`, `warden`, `warden-offline`), concurrency 3, 12 turns, the SubQ Jev backend at
+   $0.05 per 1M input tokens, the $3 Jev cap, Correction 10's caps (`--timeout-min 20`,
+   `--arc-timeout-min 20`) and the 15-minute stall rule, the analysis set, the metrics, and decision
+   rules (a) to (d). No registered number moves: one correction for one measured defect.
+
+   **The two catalog entries, side by side** (both read from `pi --list-models` on 2026-10-25):
+
+   | | `commandcode/deepseek/deepseek-v4.1-flash` | `river/deepseek-ai/DeepSeek-V4.1-Flash-1017` |
+   |---|---|---|
+   | context window | 1,000,000 | 1,048,576 |
+   | maximum output tokens | 65,536 | 384,000 |
+   | thinking levels the catalog offers | the map carries `high` | `none`, `high` and `max`; `low` is `null` |
+   | agent price per 1M tokens | DeepSeek's own rates as an equivalent | River's published flat rates: 0.12 in, 0.48 out, 0.0024 cache-read, 0 cache-write |
+   | thinking `high` accepted | measured, the 245 runs of `high-b` | measured in the smoke, from each run's own session log |
+
+   Neither ceiling cut a run of `high-b`: no run recorded a timeout and no call was refused for
+   length, so the wider ceiling of the River route changes nothing that is measured here. It stays a
+   property of the route, not a change to the task.
+
+   **Measured or assumed.** That River serves the same DeepSeek V4.1 Flash weights is **assumed**:
+   nothing on this machine proves it. The route check in the `high-c` report compares `high-b` and
+   `high-c` task by task and cell by cell, and states whether the route moved the metrics; it is
+   descriptive, it guards the level comparison, and it decides nothing. River's rate limits are
+   **assumed** generous: the first chunks measure them, and a River quota or capacity error stops the
+   batch exactly as the Commandcode one did, reported with the provider's own message, without raising
+   any cap, without switching route again and without retrying past what the runner already does.
+
+   **The `low` level stays where it is.** River's thinking map for this model carries `low: null`, and
+   River rejects a level it does not serve, so `low` is measured absent on this route and is not an
+   option for this batch: the `low` batch (`eval/reports/2026-10-25-thesis-v5-low`) stays on the
+   Commandcode route. Model B is therefore the `high` level of the model on a second route, and the
+   two levels are never pooled.
