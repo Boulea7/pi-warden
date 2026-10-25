@@ -50,6 +50,12 @@ batch was read: the corrected timeouts cannot reach a resumed batch, because the
 plan in the batch's own record, so the 552-run stopped attempt leaves the analysis set and stays on
 disk as evidence, and one clean batch carries one protocol (Corrections 9).
 
+v5, corrected again on 2026-10-25, with 391 of the 1,920 runs of the `high` batch recorded and before
+any outcome of a v5 `high` batch was read: both run timeouts move to 20 minutes, 300 s above the
+15-minute stall rule, because a cap under that rule turns every hang into a task outcome and leaves
+the stall rule nothing to recognize. The 391 recorded runs leave the analysis set and the `high` batch
+restarts in a new folder (Corrections 10).
+
 ## The stopped v3 batches
 
 The v3 batches, `deepseek/deepseek-flash` and `claude-bridge/claude-sonnet-5-5`, were stopped by the owner for cost about 13 minutes in: `deepseek/deepseek-flash` after 57 recorded runs and `claude-bridge/claude-sonnet-5-5` after 45. They are a stopped pilot: their folders stay out of version control, their outcomes are not analysed, and nothing in this registration, in a decision, or in the analysis uses them.
@@ -843,3 +849,23 @@ the power inputs, the $3 Jev cap per batch, and the commit under test.
    under. Everything else stays as registered: 39 repeats, seed 20261001, the 20 tasks and their
    families, the three cells, concurrency 3, the $3 Jev cap, the analysis set, and decision rules
    (a) to (d).
+
+10. 2026-10-25, with 391 of the 1,920 runs of the v5 `high` batch recorded and before any outcome of a
+   v5 `high` batch was read (no metric, bound or test of a `high` batch had been computed). Correction
+   8's caps cut four arc turns at exactly 609 s in two `warden` runs of those 391: `t16-decay` repeat
+   2, turn 7, and `t20-ship-arc` repeat 3, turns 4, 5 and 6. The uncut arc turns of the same 391 runs
+   put p50 at 49 s, p99 at 128 s and the maximum at 181 s over 590 turns, and no single-shot run came
+   near the 198 s cap (maximum 107 s). The registration's own sizing rule cannot fix this: three times
+   the longest uncut turn is 3 x 181 s = 543 s, under the current 609 s, so it would tighten the cap
+   and cut more. The defect is where both caps sit rather than their size: a cap below the 15-minute
+   stall rule (`--stall-min 15`) cuts a hung run as a timeout, which the registration analyses as a
+   task outcome, so the stall rule can never recognize an infrastructure failure, exclude its block,
+   and re-run it. **Both caps become 20 minutes**: `--timeout-min 20` and `--arc-timeout-min 20`
+   (1,200 s), 300 s above the stall rule, which stays at 15 minutes. A run that keeps producing
+   assistant messages or tool results may then take up to 1,200 s per turn and finish; a run that
+   makes no progress for 15 minutes is killed as a stall, its block is excluded, and it is re-run once
+   ("Resume", Corrections 4). The 391 runs of the stopped attempt
+   (`eval/reports/2026-10-25-thesis-v5-high`) keep their folder as evidence and leave the analysis set;
+   the `high` batch restarts from zero in `eval/reports/2026-10-25-thesis-v5-high-b`. Everything else
+   stays as registered: 32 repeats, seed 20261001, the 20 tasks and their families, the three cells,
+   concurrency 3, the $3 Jev cap, the analysis set, and decision rules (a) to (d).
