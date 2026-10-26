@@ -940,3 +940,14 @@ the power inputs, the $3 Jev cap per batch, and the commit under test.
    option for this batch: the `low` batch (`eval/reports/2026-10-25-thesis-v5-low`) stays on the
    Commandcode route. Model B is therefore the `high` level of the model on a second route, and the
    two levels are never pooled.
+
+12. 2026-10-25, with 1,734 of the 1,920 runs of the `high-c` batch recorded and after the batch had
+   stopped on a failed judgment: `t17-clip-arc` `warden` repeat 29 got `HTTP 422` from SubQ at
+   2026-10-25T21:53:17.393Z ("TypeSafe returned HTTP 422. Check the question format and model limits. No
+   automatic retry was made."), its run was not counted, and the runner exited with code 3, as the
+   "Jev-error stop" section requires (the failure is `http`, not `aborted`, so Corrections 2's cancelled
+   trace sample does not apply; it is the only failed judgment in the batch's 640 warden ledgers). The
+   owner decided to resume. The batch resumed in the same folder with the same plan and the same
+   provider extension, the stopped run re-ran as one of the pending plan rows and counted, and the
+   batch reached all 1,920 runs with no excluded block. No registered number changes; the stop stays in
+   `eval/reports/2026-10-25-thesis-v5-high-c/runs.json` under `stops`, and the report names it.
