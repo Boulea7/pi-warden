@@ -14,13 +14,13 @@
 
 </div>
 
-![pi-warden tells the agent what it got wrong and the agent fixes it: told 124 times that it said done with nothing checked, the agent ran a check next 94 times (76%); of 111 held actions with a known outcome, the agent found a safer way 79 times, you approved 29, you said no 3 times; 422 steers named a project rule; 1,168 real sessions, 2026-09-16 to 2026-10-01](https://raw.githubusercontent.com/DevMortimer/pi-warden/main/docs/hero.png)
+![pi-warden tells the agent what it got wrong and the agent fixes it: told 255 times that it said done with nothing checked, the agent ran a check next 182 times (71%); of 276 held actions with a known outcome, the agent found a safer way 235 times, you approved 30, you said no 11 times; 598 steers named a project rule; 3,350 real sessions, 2026-09-16 to 2026-10-26](https://raw.githubusercontent.com/DevMortimer/pi-warden/main/docs/hero.png)
 
 <div align="center">
 
-**1,168 sessions · 419 risky actions stopped before they ran · 76% of fake "done"s turned into real test runs**
+**3,350 sessions · 817 risky actions stopped before they ran · 71% of fake "done"s turned into real test runs**
 
-<sub>Sixteen days of the maintainer's real use across all their projects, not just this one, 2026-09-16 to 2026-10-01. Method and noise: [field report](eval/reports/2026-10-01-field-usage/).</sub>
+<sub>Forty-one days of the maintainer's real use across all their projects, not just this one, 2026-09-16 to 2026-10-26. Method and noise: [field report](eval/reports/2026-10-27-field-usage/).</sub>
 
 </div>
 
@@ -146,8 +146,8 @@ Coming from 0.74.1? See [Upgrading](docs/upgrading.md).
 ## Receipts
 
 - **Rules:** in 150 paired agent runs (four batches, `eval/reports/2026-09-18T00-*`), the agent without pi-warden broke a project rule in **6** of 150 runs. With it: **0** of 150.
-- **Done-check:** after a nudge, the agent ran a check **94 of 124** times, and sometimes found a failure it had missed.
-- **Holds:** when the agent was stopped, it found a safer way **79 of 111** times; you approved 29. Field data from 2026-09-16 to 2026-10-01, across versions, so it includes holds from before the 0.9 threshold and the `rm` scratch change.
+- **Done-check:** after a nudge, the agent ran a check **182 of 255** times, and sometimes found a failure it had missed.
+- **Holds:** when the agent was stopped, it found a safer way **235 of 276** times; you approved 30. Field data from 2026-09-16 to 2026-10-26, across versions, so it includes holds from before the 0.9 threshold and the `rm` scratch change.
 - **Stability:** 13,952 guard cases over 109 overnight cycles, no score drift.
 
 Every number has a script and a raw report in [`eval/reports/`](eval/reports/) or the Calibration section of [the guard docs](docs/guards.md#calibration). They are the maintainer's measurements, not a universal promise, and the reports list what was noise.
