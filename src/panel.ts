@@ -246,11 +246,11 @@ export class ConfigPanel implements Component {
   private readonly edits = new Map<string, unknown>();
   private readonly entries: ConfigEntry[];
 
-  constructor(private readonly config: WardenConfig, private readonly theme: ThemeLike, private readonly actions: PanelActions, private readonly requestRender: () => void, private readonly dirs: HostDirs = defaultHostDirs(), userRaw?: unknown, private readonly onWrite?: (changes: ReadonlyMap<string, unknown>) => void) {
+  constructor(private readonly config: WardenConfig, private readonly theme: ThemeLike, private readonly actions: PanelActions, private readonly requestRender: () => void, private readonly dirs: HostDirs = defaultHostDirs(), userRaw?: unknown, private readonly onWrite?: (changes: ReadonlyMap<string, unknown>) => void, private readonly getConfig?: () => WardenConfig) {
     // The session's snapshot when it has one: the panel shows what the checks use, not a file edit that waits for /new.
     const raw = userRaw !== null && typeof userRaw === "object" ? userRaw as Record<string, unknown> : readUserConfig(dirs);
     const user = applyUserOverrides(defaultConfig(), raw);
-    let visible: Record<string, unknown> = { ...config, context: { recallTool: user.context.recallTool } };
+    let visible: Record<string, unknown> = { ...config };
     // Only selector rows use the user layer; never persist a trusted project's recall override here.
     for (const path of Object.keys(SELECTOR_OPTIONS)) {
       const value = getNestedValue(raw, path);
@@ -461,6 +461,15 @@ export class ConfigPanel implements Component {
       }
       writeUserConfig(obj, this.dirs);
       this.onWrite?.(changes);
+      const effective = this.getConfig?.();
+      if (effective) {
+        // A project can still override a saved user leaf; keep other staged rows and raw selectors intact.
+        for (const entry of this.entries) {
+          if (entry.path.startsWith("context.") && entry.type !== "select" && changes.has(entry.path)) {
+            entry.value = getNestedValue(effective as unknown as Record<string, unknown>, entry.path);
+          }
+        }
+      }
       this.notice = "";
       return true;
     } catch (error) {
@@ -471,12 +480,12 @@ export class ConfigPanel implements Component {
   }
 }
 
-export function openConfigPanel(ui: PanelUi, config: WardenConfig, options: { width?: string | number; dirs?: HostDirs; userRaw?: unknown; onWrite?: (changes: ReadonlyMap<string, unknown>) => void } = {}): PanelController {
+export function openConfigPanel(ui: PanelUi, config: WardenConfig, options: { width?: string | number; dirs?: HostDirs; userRaw?: unknown; onWrite?: (changes: ReadonlyMap<string, unknown>) => void; getConfig?: () => WardenConfig } = {}): PanelController {
   let close: () => void = () => {};
   let unfocus: () => void = () => {};
   const closed = ui.custom<void>((tui, theme, _keybindings, done) => {
     close = () => done();
-    const panel = new ConfigPanel(config, theme, { close, unfocus: () => unfocus() }, () => tui.requestRender(), options.dirs, options.userRaw, options.onWrite);
+    const panel = new ConfigPanel(config, theme, { close, unfocus: () => unfocus() }, () => tui.requestRender(), options.dirs, options.userRaw, options.onWrite, options.getConfig);
     const rows = tui.terminal?.rows;
     if (typeof rows === "number") panel.setViewport(rows - 2);
     return panel;

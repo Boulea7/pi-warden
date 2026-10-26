@@ -6,6 +6,10 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 ## Unreleased
 
+### Fixed
+
+- The config panel again shows the context settings alongside the recall selector, including output trimming, compaction, large output and filter controls. Numeric and boolean edits stay staged until saved; saved rows continue to show the effective session value when a trusted project overrides the user file.
+
 ### Changed
 
 - Eval: the pre-registered run can continue on another inference route when a provider stops, with the route change, the judgment stop and the route price all recorded in `eval/preregistration.md` and `eval/config.mjs`.

@@ -3047,6 +3047,114 @@ test("/warden config opens the interactive panel and saves on 's'", async () => 
   await new Promise(resolve => setTimeout(resolve, 0));
 });
 
+test("/warden config saves context into the running snapshot and reopens its effective value", async () => {
+  await rm(join(temporary, ".pi", "pi-warden.json"), { force: true });
+  await writeConfig(JSON.stringify({ context: { tailMinChars: 12000 }, rules: { enabled: false } }));
+  const selectTail = (panel: (typeof openPanels)[number]) => {
+    panel.handleInput("\x1b[H");
+    for (let index = 0; index < 200; index++) {
+      const line = panel.render(120).find(line => line.startsWith("│   > tailMinChars "));
+      if (line) return line;
+      panel.handleInput("\x1b[B");
+    }
+    assert.fail("the context tail control is navigable through the command's overlay");
+  };
+  await runCommand("config");
+  const panel = openPanels.at(-1)!;
+  assert.ok(selectTail(panel).endsWith("12000"));
+  panel.handleInput("\r");
+  for (const _char of "12000") panel.handleInput("\x7f");
+  for (const char of "9000") panel.handleInput(char);
+  panel.handleInput("\r");
+  panel.handleInput("s");
+  await runCommand("config get context.tailMinChars");
+  assert.match(notices.at(-1)!.text, /context\.tailMinChars = 9000/, "the panel write updates the running snapshot");
+  const disk = JSON.parse(await readFile(configPath(), "utf8")) as Record<string, unknown>;
+  await writeFile(configPath(), JSON.stringify({ ...disk, context: { tailMinChars: 6000 } }));
+  panel.handleInput("q");
+  await tick();
+  await runCommand("config");
+  const reopened = openPanels.at(-1)!;
+  assert.ok(selectTail(reopened).endsWith("9000"), "reopening keeps the session value after an outside edit");
+  reopened.handleInput("q");
+  await tick();
+  await sessionStart();
+  await runCommand("config");
+  const next = openPanels.at(-1)!;
+  assert.ok(selectTail(next).endsWith("6000"), "the next session loads the outside edit");
+  next.handleInput("q");
+  await tick();
+});
+
+test("/warden config context saves keep trusted numeric and boolean values effective", async t => {
+  const projectPath = join(temporary, ".pi", "pi-warden.json");
+  await mkdir(join(temporary, ".pi"), { recursive: true });
+  await writeFile(projectPath, JSON.stringify({ context: { tailMinChars: 6400, compactAppendix: false, recallTool: "none" } }));
+  t.after(() => rm(projectPath, { force: true }));
+  await writeConfig(JSON.stringify({ typesafe: true, context: { tailMinChars: 12000, compactAppendix: false }, rules: { enabled: false }, cause: { enabled: false } }));
+  const select = (panel: (typeof openPanels)[number], path: string) => {
+    const keys = path.split(".");
+    const prefix = `│ ${"  ".repeat(keys.length - 1)}> ${keys.at(-1)} `;
+    panel.handleInput("\x1b[H");
+    for (let index = 0; index < 200; index++) {
+      const line = panel.render(120).find(line => line.startsWith(prefix));
+      if (line) return line;
+      panel.handleInput("\x1b[B");
+    }
+    assert.fail(`the context control ${path} is navigable through the command's overlay`);
+  };
+  const text = (panel: (typeof openPanels)[number], path: string, before: string, after: string) => {
+    select(panel, path);
+    panel.handleInput("\r");
+    for (const _char of before) panel.handleInput("\x7f");
+    for (const char of after) panel.handleInput(char);
+    panel.handleInput("\r");
+  };
+  await runCommand("config");
+  const panel = openPanels.at(-1)!;
+  text(panel, "context.filter.chunkChars", "2000", "1500");
+  select(panel, "context.recallTool");
+  panel.handleInput("\r");
+  panel.handleInput("\x1b[C");
+  panel.handleInput("\r");
+  assert.ok(select(panel, "context.filter.chunkChars").endsWith("1500 *"), "a selector save preserves the other context draft");
+  text(panel, "context.tailMinChars", "6400", "9000");
+  select(panel, "context.compactAppendix");
+  panel.handleInput("\r");
+  const outside = JSON.parse(await readFile(configPath(), "utf8"));
+  await writeFile(configPath(), JSON.stringify({ ...outside, context: { ...outside.context, duplicateMinChars: 512 } }));
+  await writeFile(projectPath, JSON.stringify({ context: { tailMinChars: 3200, compactAppendix: true, recallTool: "grep" } }));
+  panel.handleInput("s");
+  const saved = JSON.parse(await readFile(configPath(), "utf8"));
+  assert.deepEqual(saved.context, { tailMinChars: 9000, compactAppendix: true, recallTool: "rg", duplicateMinChars: 512, filter: { chunkChars: 1500 } }, "the user file receives only the selected leaf changes over the outside edit");
+  assert.ok(select(panel, "context.tailMinChars").endsWith("6400"), "the saved row shows the effective project snapshot, without a pending mark");
+  assert.ok(select(panel, "context.compactAppendix").endsWith("○"), "the boolean row also keeps the effective project value");
+  assert.ok(select(panel, "context.recallTool").endsWith("‹ rg ›"), "selectors continue to show the user layer");
+  assert.ok(select(panel, "context.duplicateMinChars").endsWith("2000"), "an outside user edit still waits for the next session");
+  nextAnswers = { retention: "all" };
+  await toolResult("bash", { command: "cat output" }, "output\n".repeat(1000), false);
+  assert.ok(requests.some(request => "retention" in request.questions), "the running guard still uses the project's 6400 threshold, not the user's 9000");
+  await toolResult("bash", { command: "npm run build" }, "error TS2322: Type mismatch", true);
+  await fire("session_compact", { compactionEntry: {}, fromExtension: false, reason: "manual", willRetry: false });
+  assert.doesNotMatch(await nextPromptAppend("after the compaction"), /PI-WARDEN COMPACT EVIDENCE/, "the running session still uses the project's false compactAppendix value");
+  panel.handleInput("q");
+  await tick();
+  await runCommand("config");
+  const reopened = openPanels.at(-1)!;
+  assert.ok(select(reopened, "context.tailMinChars").endsWith("6400"));
+  assert.ok(select(reopened, "context.compactAppendix").endsWith("○"));
+  assert.ok(select(reopened, "context.filter.chunkChars").endsWith("1500"));
+  reopened.handleInput("q");
+  await tick();
+  await sessionStart();
+  await runCommand("config");
+  const next = openPanels.at(-1)!;
+  assert.ok(select(next, "context.tailMinChars").endsWith("3200"), "the next session loads the outside project edit");
+  assert.ok(select(next, "context.compactAppendix").endsWith("●"));
+  next.handleInput("q");
+  await tick();
+});
+
 test("/warden config closes on the second call instead of stacking an overlay", async () => {
   await grantConsent();
   await runCommand("config");
