@@ -6,7 +6,10 @@ How to keep this current: add the entry in the same pull request as the change, 
 
 ## Unreleased
 
-<!-- Empty. Next release starts here. -->
+### Changed
+
+- Eval: the pre-registered run can continue on another inference route when a provider stops, with the route change, the judgment stop and the route price all recorded in `eval/preregistration.md` and `eval/config.mjs`.
+- Eval: a batch folder keeps its `report.md` in git and leaves the parsed run file local, like the run trees under it.
 
 ## 2.2.2
 
