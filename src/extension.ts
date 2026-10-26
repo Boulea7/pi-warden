@@ -896,10 +896,10 @@ export default function wardenExtension(host: ExtensionAPI): void {
     return traceFile ? `${text}\nTrace file: ${traceFile.path}` : text;
   };
   /** The config overlay toggles the same way the sidebar does, so the hint in its header is true. */
-  const toggleConfigPanel = (ui: PanelUi | undefined, config: WardenConfig) => {
+  const toggleConfigPanel = (ui: PanelUi | undefined, config: WardenConfig, getConfig: () => WardenConfig) => {
     if (!ui) return;
     if (configPanel) { configPanel.close(); return; }
-    const opened = openConfigPanel(ui, config, { width: config.widget.panelWidth, dirs, userRaw: sessionUser?.value, onWrite: changes => userConfigWritten(changes) });
+    const opened = openConfigPanel(ui, config, { width: config.widget.panelWidth, dirs, userRaw: sessionUser?.value, onWrite: changes => userConfigWritten(changes), getConfig });
     configPanel = opened;
     opened.closed.catch(() => undefined).finally(() => { if (configPanel === opened) configPanel = undefined; });
   };
@@ -3556,7 +3556,7 @@ export default function wardenExtension(host: ExtensionAPI): void {
             return;
           }
           if (!ctx.hasUI || !lastUi) { report(`Edit ${userConfigPath(dirs)} directly; a hand edit applies at the next session (/new). Use /warden config set <key> <value> to apply one at once.`); return; }
-          toggleConfigPanel(lastUi, config);
+          toggleConfigPanel(lastUi, config, () => sessionConfig(ctx.cwd, ctx.isProjectTrusted()));
           return;
         }
         if (action === "init") {

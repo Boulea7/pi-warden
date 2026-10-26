@@ -349,7 +349,11 @@ test("config selector: recall edits use the user layer while a trusted project k
     const original = panel.bytes();
     panel.select("context.recallTool");
     assert.ok(panel.selected("context.recallTool")!.includes(`‹ ${userValue ?? "auto"} ›`));
-    assert.doesNotMatch(panel.render(), /tailMinChars|duplicateMinChars|compactAppendix/);
+    for (const path of ["context.tailMinChars", "context.compactAppendix", "context.filter.chunkChars"]) {
+      panel.select(path);
+      assert.ok(panel.selected(path), "ordinary context controls remain navigable beside the recall selector");
+    }
+    panel.select("context.recallTool");
     panel.press(enter);
     panel.press(enter);
     assert.equal(panel.bytes(), original);
@@ -365,7 +369,98 @@ test("config selector: recall edits use the user layer while a trusted project k
   }
 });
 
-for (const { path, options } of selectors.filter(selector => ["conscience.skills.mode", "widget.placement"].includes(selector.path))) {
+test("config context: numeric and boolean drafts stay separate from recall saves and preserve later user edits", t => {
+  const raw = { context: { tailMinChars: 12000, compactAppendix: true, recallTool: "auto", filter: { chunkChars: 2000, extra: "keep" }, extra: "original" }, extra: "keep" };
+  const writes: Array<Array<[string, unknown]>> = [];
+  const panel = configPanel(t, raw, undefined, undefined, { onWrite: changes => writes.push([...changes]) });
+  const original = panel.bytes();
+  panel.text("context.tailMinChars", "12000", "9000");
+  panel.select("context.compactAppendix");
+  panel.press(enter);
+  panel.text("context.filter.chunkChars", "2000", "1500");
+  assert.equal(panel.bytes(), original, "context edits remain staged");
+  panel.select("context.recallTool");
+  panel.press(enter);
+  panel.press(right);
+  panel.press(enter);
+  assert.deepEqual(readUserConfig(panel.dirs), { ...raw, context: { ...raw.context, recallTool: "rg" } });
+  assert.deepEqual(writes, [[["context.recallTool", "rg"]]]);
+  for (const path of ["context.tailMinChars", "context.compactAppendix", "context.filter.chunkChars"]) {
+    panel.select(path);
+    assert.ok(panel.selected(path)!.endsWith(" *"), "recall saves retain ordinary context drafts");
+  }
+  const later = { ...raw, extra: "updated", context: { ...raw.context, recallTool: "rg", extra: "updated", filter: { ...raw.context.filter, later: true } } };
+  writeUserConfig(later, panel.dirs);
+  panel.press("s");
+  assert.deepEqual(readUserConfig(panel.dirs), { ...later, context: { ...later.context, tailMinChars: 9000, compactAppendix: false, filter: { ...later.context.filter, chunkChars: 1500 } } });
+  assert.deepEqual(writes[1], [["context.tailMinChars", 9000], ["context.compactAppendix", false], ["context.filter.chunkChars", 1500]]);
+});
+
+for (const trusted of [false, true]) {
+  test("config context: effective values and user-only filter consent respect project trust " + trusted, t => {
+    let project = "";
+    let projectPath = "";
+    const panel = configPanel(t, { context: { filter: { enabled: false } }, extra: "keep" }, (root, dirs) => {
+      project = join(root, "project");
+      projectPath = projectConfigPath(project, dirs);
+      mkdirSync(dirname(projectPath), { recursive: true });
+      writeFileSync(projectPath, JSON.stringify({ context: { enabled: false, tailMinChars: 6400, duplicateMinChars: 512, compactAppendix: false, recallTool: "none", filter: { enabled: true, chunkChars: 777 } } }));
+      const config = loadConfig({ dirs, cwd: project, projectTrusted: trusted });
+      assert.equal(config.context.filter.enabled, false, "a project cannot enable the filter");
+      return config;
+    });
+    const original = panel.bytes();
+    const projectBytes = readFileSync(projectPath, "utf8");
+    panel.select("context.tailMinChars");
+    assert.ok(panel.selected("context.tailMinChars")!.endsWith(trusted ? "6400" : "12000"));
+    panel.select("context.compactAppendix");
+    assert.ok(panel.selected("context.compactAppendix")!.endsWith(trusted ? "○" : "●"));
+    panel.select("context.filter.chunkChars");
+    assert.ok(panel.selected("context.filter.chunkChars")!.endsWith(trusted ? "777" : "2000"));
+    // Anchor at the unique child before moving to filter.enabled; largeOutput has another enabled row.
+    panel.press("\x1b[A");
+    assert.ok(panel.selected("context.filter.enabled")!.endsWith("○"));
+    panel.press(enter);
+    assert.ok(panel.selected("context.filter.enabled")!.endsWith("● *"));
+    panel.select("context.recallTool");
+    assert.ok(panel.selected("context.recallTool")!.includes("‹ auto ›"), "recall still shows the user default");
+    panel.press(enter);
+    panel.press(enter);
+    assert.equal(panel.bytes(), original);
+    panel.text("context.tailMinChars", trusted ? "6400" : "12000", "9000");
+    panel.press("s");
+    assert.deepEqual(readUserConfig(panel.dirs), { context: { filter: { enabled: true }, tailMinChars: 9000 }, extra: "keep" }, "only edited leaves enter the user file");
+    assert.equal(readFileSync(projectPath, "utf8"), projectBytes, "the project file stays untouched");
+    const effective = loadConfig({ dirs: panel.dirs, cwd: project, projectTrusted: trusted });
+    assert.equal(effective.context.tailMinChars, trusted ? 6400 : 9000);
+    assert.equal(effective.context.recallTool, trusted ? "none" : "auto");
+    assert.equal(effective.context.filter.enabled, true, "the explicit user choice enables the filter");
+  });
+}
+
+test("config context: a 24-row deep numeric edit stays visible after a failed save and retries with s", t => {
+  const panel = configPanel(t, { context: { filter: { chunkChars: 2000 } }, extra: "keep" }, undefined, { rows: 24, width: 80 });
+  const original = panel.bytes();
+  panel.text("context.filter.chunkChars", "2000", "1500");
+  assert.equal(panel.bytes(), original);
+  const parked = join(panel.root, "parked-agent");
+  renameSync(panel.dirs.agentDir, parked);
+  writeFileSync(panel.dirs.agentDir, "temporary obstruction");
+  panel.press("s");
+  const failed = panel.render();
+  assert.equal(failed.split("\n").length, 22);
+  assert.match(failed.replace(/\n│ /g, " "), /Save failed\. Retry s\./);
+  assert.ok(panel.selected("context.filter.chunkChars")!.endsWith("1500 *"));
+  rmSync(panel.dirs.agentDir);
+  renameSync(parked, panel.dirs.agentDir);
+  assert.equal(panel.bytes(), original);
+  panel.press("s");
+  assert.deepEqual(readUserConfig(panel.dirs), { context: { filter: { chunkChars: 1500 } }, extra: "keep" });
+  assert.ok(panel.selected("context.filter.chunkChars")!.endsWith("1500"));
+  assert.doesNotMatch(panel.render(), /Save failed/);
+});
+
+for (const { path, options } of selectors.filter(selector => ["conscience.skills.mode", "widget.placement", "context.recallTool"].includes(selector.path))) {
   test(`config selector: 24-row ${path} keeps a write error and its selection visible for retry`, t => {
     const raw = setNestedValue({ enabled: true, maxRequests: 500, extra: "keep" }, path, options[0]);
     const panel = configPanel(t, raw, undefined, { rows: 24, width: 80 });

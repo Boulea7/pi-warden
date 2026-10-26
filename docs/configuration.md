@@ -14,6 +14,8 @@ The panel shows selectors for `mode`, `typesafeBackend`, `widget.placement`, `wi
 
 Selectors show the user setting or its default. A trusted project can still override a saved `context.recallTool` value. A custom backend remains editable through its child fields; the parent selector can replace it with a named backend from pi-typesafe's registry. Save pending backend child edits with `s` before replacing the parent. A failed write leaves the selection and staged edits available to retry.
 
+The `context` section also exposes its numeric and boolean settings, including `largeOutput` and `filter`. These rows show the effective session values, including trusted project overrides, even after saving. Saving writes only the fields you changed to your user file and leaves project overrides in place; `context.filter.enabled` is user-only.
+
 Missing keys use these defaults:
 
 ```json
