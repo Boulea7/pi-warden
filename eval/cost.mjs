@@ -8,7 +8,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { JEV_PRICE, hasPrice, priceFor } from "./config.mjs";
+import { hasPrice, jevPrice, priceFor } from "./config.mjs";
 
 /**
  * One entry per assistant turn that carries `usage`: the call's start time (the
@@ -74,11 +74,14 @@ export function jevUsage(agentDir) {
 
 const round6 = (x) => Math.round(x * 1e6) / 1e6;
 
-/** The Jev dollars of a run's requests and tokens, at the Jev prices. */
-export function jevDollars(jev) {
+/** The Jev dollars of a run's requests and tokens, at the named backend's prices (TypeSafe when none is named). */
+export function jevDollars(jev, backend = "typesafe") {
+  const price = jevPrice(backend);
+  // A backend the price table does not hold would otherwise be priced at another's rate and go unnoticed.
+  if (!price) throw new Error(`no Jev price for backend "${backend}" in eval/config.mjs`);
   return round6(
-    jev.requests * JEV_PRICE.perRequestUsd +
-    (jev.inputTokens * JEV_PRICE.inputUsdPerMTok + jev.outputTokens * JEV_PRICE.outputUsdPerMTok) / 1e6,
+    jev.requests * price.perRequestUsd +
+    (jev.inputTokens * price.inputUsdPerMTok + jev.outputTokens * price.outputUsdPerMTok) / 1e6,
   );
 }
 
@@ -103,10 +106,10 @@ export function callCosts(events, model) {
  * null when the price table cannot price some call; the token counts are still
  * reported. `windows` splits the agent dollars by price window.
  */
-export function runCost({ events, agentDir, model }) {
+export function runCost({ events, agentDir, model, jevBackend = "typesafe" }) {
   const tokens = sessionTokens(events);
   const jev = jevUsage(agentDir);
-  const jevUsd = jevDollars(jev);
+  const jevUsd = jevDollars(jev, jevBackend);
   const calls = callCosts(events, model);
   // A Jev ledger that cannot be read leaves the run's Jev dollars unknown: no total, so (c) leaves the run out.
   if (jev.unreadable) {

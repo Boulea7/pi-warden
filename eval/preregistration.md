@@ -29,6 +29,39 @@ v4, corrected while model B's main pass ran, after it had excluded more than 10%
 
 v4, after both batches finished and before any decision-rule bound, test, or metric of a v4 batch was computed: the stops and other events of both batches are recorded (Corrections 5 and 6), and the methods behind the decision rules' bounds and p-value are fixed (Corrections 7).
 
+v5, registered on 2026-10-24 before any v5 batch exists: the run moves to the owner's flat-rate
+commandcode subscription, one model at two thinking levels, `commandcode/deepseek/deepseek-v4.1-flash`
+at `low` and then at `high`, one batch per level, run one after the other; judgments go to SubQ instead
+of TypeSafe and are priced at SubQ's own rate. The owner asked for `medium` and `high`; two measurements
+say this model has no `medium` level and that pi answers a `medium` request with `high`, so `low` and
+`high` are registered, and the owner confirmed that pair on 2026-10-24. "The v5 run" below states every
+change against v4; the tasks, families, blocks, seed, decision rules, metrics, infrastructure rules,
+Jev-error stop, stall rule, and the commit under test are unchanged.
+
+v5, corrected on 2026-10-24, with 552 of the 2,340 runs of the `low` batch recorded and before any
+outcome of a v5 batch was read: the timeouts came from a smoke that under-measured the load at the
+same concurrency (single-shot mean 10.8 s, longest 12 s in the smoke against 17.5 s and 66 s in the
+batch), so they become three times the longest run of the same kind that was not cut in the runs
+recorded so far — 198 s for a single-shot run and 609 s for one turn of a multi-turn run. The 552
+recorded runs, including the one the old cap cut, stay in the analysis set (Corrections 8).
+
+v5, restarted on 2026-10-25 with Correction 8's caps in a new folder, before any outcome of a v5
+batch was read: the corrected timeouts cannot reach a resumed batch, because the harness freezes the
+plan in the batch's own record, so the 552-run stopped attempt leaves the analysis set and stays on
+disk as evidence, and one clean batch carries one protocol (Corrections 9).
+
+v5, corrected again on 2026-10-25, with 391 of the 1,920 runs of the `high` batch recorded and before
+any outcome of a v5 `high` batch was read: both run timeouts move to 20 minutes, 300 s above the
+15-minute stall rule, because a cap under that rule turns every hang into a task outcome and leaves
+the stall rule nothing to recognize. The 391 recorded runs leave the analysis set and the `high` batch
+restarts in a new folder (Corrections 10).
+
+v5, corrected on 2026-10-25, with 245 of the 1,920 runs of the `high-b` batch recorded and before any
+outcome of a `high-c` batch was read: the Commandcode route refused five calls in a row with its own
+weekly-quota 429 (reset 2026-10-28T09:19:08.820Z), so the `high` batch restarts on the River route in
+a new folder with no registered number changed, and the 245 recorded runs stay on disk as evidence
+(Corrections 11).
+
 ## The stopped v3 batches
 
 The v3 batches, `deepseek/deepseek-flash` and `claude-bridge/claude-sonnet-5-5`, were stopped by the owner for cost about 13 minutes in: `deepseek/deepseek-flash` after 57 recorded runs and `claude-bridge/claude-sonnet-5-5` after 45. They are a stopped pilot: their folders stay out of version control, their outcomes are not analysed, and nothing in this registration, in a decision, or in the analysis uses them.
@@ -403,6 +436,101 @@ for timings only), the v3 smoke runs, and the stopped v3 batches prove the pipel
 the speed. Their runs never enter the analysis above, and none of them was read for an
 outcome to choose the concurrency, the timeouts, or the sizes.
 
+## The v5 run (2026-10-24)
+
+Registered before any v5 batch exists. "Design", "Block order and seed" (seed 20261001), "Resume",
+"Infrastructure failures" (including the 15-minute stall rule and the 10% block rule), "Jev-error
+stop", "Metrics (primary)", "Decision rules", "Power", and "Not evidence" apply to v5 unchanged.
+This section states only what v5 changes.
+
+**Model and levels.** One agent model, `commandcode/deepseek/deepseek-v4.1-flash`, confirmed with
+`pi --list-models` (provider `commandcode`, reasoning `yes`), at two thinking levels, `low` and then
+`high`, one batch per level, run one after the other as v4 ran its two models. The owner asked for
+`medium` and then `high`. Two measurements say `medium` cannot run on this model: its provider lists
+the thinking levels `off`, `low`, `high`, `max`
+(`node_modules/pi-commandcode-provider/src/commandcode-catalog.ts`, read 2026-10-24), with no `medium`;
+and a real run at `--thinking medium` records `{"type":"thinking_level_change","thinkingLevel":"high"}`
+in its session log, so pi answers `medium` with `high` and a `medium` batch would be a second `high`
+batch. `low` and `high` are registered in that order, and the owner confirmed that pair on 2026-10-24.
+
+**Smoke timings** (`PI_MODEL` and `PI_REASONING_LEVEL` read back from every run's session log;
+timings and cost only — no outcome was read, and these runs are not evidence, per "Not evidence").
+Two single-shot tasks (t6-dsn, t10-fixfail) x 3 cells x 1 repeat, and the 5-turn arc t17-clip-arc x 3
+cells x 1 repeat, each level on its own, at concurrency 3:
+
+| Level | Kind | Runs | Run seconds, mean / longest | Agent tokens, mean | Agent $, mean | Jev $, mean | Jev requests, mean |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| low | single-shot | 6 | 10.8 s / 12 s | 24,000 | 0.00128 | 0.00017 | 1.8 |
+| low | multi-turn (5 turns) | 3 | 86 s / 139 s | 181,195 | 0.01039 | 0.00090 | 9.0 |
+| high | single-shot | 6 | 14.7 s / 22 s | 29,704 | 0.00156 | 0.00019 | 2.7 |
+| high | multi-turn (5 turns) | 3 | 103 s / 145 s | 224,097 | 0.01211 | 0.00088 | 8.3 |
+
+No run was cut by the smoke's own 45-minute cap and none timed out. The Jev requests are the warden
+cell's own ledger; the control and `warden-offline` cells made none.
+
+**Sizing.** As in v4: one repeat is three cells x (15 single-shot tasks + 4 multi-turn tasks + the
+12-turn decay arc), with the arc priced at 12 turns of the measured per-turn time (low 86/5 = 17.2 s,
+high 103/5 = 20.6 s).
+
+- low: 3 x (15 x 10.8 s + 4 x 86 s + 12 x 17.2 s) = 3 x 712.4 s = 2,137 s = 0.594 h per repeat.
+  At the 98% busy slot of concurrency 3: 24 h x 0.98 / 0.594 h = **39.6, so 39 repeats** =
+  39 x 20 tasks x 3 cells = **2,340 runs**.
+- high: 3 x (15 x 14.7 s + 4 x 103 s + 12 x 20.6 s) = 3 x 879.7 s = 2,639 s = 0.733 h per repeat;
+  24 h x 0.98 / 0.733 h = **32.1, so 32 repeats** = 32 x 20 x 3 = **1,920 runs**.
+
+The 98% busy fraction is v4's measurement of the same machine and concurrency; v5's smoke made no
+queue measurement of its own (see "Not evidence" and the v5 report's gaps).
+
+**Timeouts** are three times the longest smoke run of the same kind, taken from the slower level and
+used for both levels, as v4 used one pair for both models: a single-shot run, 3 x 22 s = **66 s**
+(`--timeout-min 1.1`); one turn of a multi-turn run, 3 x 145 s = **435 s** (`--arc-timeout-min 7.25`).
+A timeout stays a task outcome.
+
+**Prices.** Agent dollars are equivalents: the commandcode subscription bills nothing per token, so
+`PRICES["commandcode/deepseek/deepseek-v4.1-flash"]` in `eval/config.mjs` prices the model at DeepSeek's
+official `deepseek-flash` peak and off-peak rates, each call by the rate of its own timestamp, exactly
+as v4 priced `cheapestinference/deepseek-v4.1-flash` (DeepSeek's price page, read 2026-10-01; the 2026
+Chinese holiday calendar unchanged). Jev dollars are SubQ's own published rate, **$0.05 per 1M input
+tokens**, output free, from pi-typesafe's installed backend registry
+(`node_modules/pi-typesafe/dist/backends.js`, read 2026-10-24), which also sets SubQ's model
+`subq-snap-preview`. `--jev-usd-cap 3` is therefore $3 of SubQ judgments per level; the smoke's
+$0.0009 per warden run over 780 warden runs of the low level estimates about $0.7 per level.
+
+**Jev backend.** Judgments go to SubQ: `--jev-backend subq` writes `typesafeBackend: "subq"` into each
+Jev cell's own pi-warden config and places pi-typesafe's stored SubQ key, or `SUBQ_API_KEY` from the
+harness's environment, in that run's own `pi-typesafe/auth.json` at mode 0600. The key never enters a
+child's environment: the harness drops the variable for every backend it knows. A run whose key is
+missing judges with judgments off, which the Jev-error stop reports. `--typesafe-cap` is not used.
+
+**Commit under test.** The `src/` tree of commit `61add30ee3c0e41162b466a1c182bed03abc6bd5`, built with
+`npm run build` at 2026-10-24T09:43:41Z. `scripts/eval-ab.mjs` loads `extensions/index.js`, which
+re-exports `dist/extension.js`, so the batch runs that build. The launch checks that
+`git diff 61add30ee3c0e41162b466a1c182bed03abc6bd5 HEAD -- src` prints nothing.
+
+Launch, `low` first and `high` on its exit code as v4 sequenced its models (exit 0: done, the next
+level starts; exit 4: wait 15 minutes and resume, at most 4 times; any other code: stopped, no resume):
+
+```
+node scripts/eval-ab.mjs --model commandcode/deepseek/deepseek-v4.1-flash --thinking low --jev-backend subq --repeats 39 --turns 12 --concurrency 3 --seed 20261001 --timeout-min 1.1 --arc-timeout-min 7.25 --stall-min 15 --jev-usd-cap 3 --out <batch folder, low>
+node scripts/eval-ab.mjs --model commandcode/deepseek/deepseek-v4.1-flash --thinking high --jev-backend subq --repeats 32 --turns 12 --concurrency 3 --seed 20261001 --timeout-min 1.1 --arc-timeout-min 7.25 --stall-min 15 --jev-usd-cap 3 --out <batch folder, high>
+```
+
+A stopped v5 batch continues with `node scripts/eval-ab.mjs --resume <batch folder> --jev-backend subq
+--concurrency 3 --jev-usd-cap 3`; the resumed batch keeps its level, model, seed, and backend, and
+refuses a different value for any of them.
+
+**What v5 changes against v4.** The agent model and provider (`commandcode/deepseek/deepseek-v4.1-flash`
+instead of `cheapestinference/deepseek-v4.1-flash` and `cheapestinference/mimo-v2.5`); one model at two
+thinking levels instead of two models at one level each; the judgment backend (SubQ instead of TypeSafe)
+and its price; the repeats (39 and 32 instead of 6 and 7) and the timeouts (66 s and 435 s instead of
+90 min and 113 min), both from this run's own smoke timings; the launch commands.
+
+**What v5 does not change.** The 20 tasks and their families, the three cells and their one-switch
+difference, the blocks and their seeded cell order (seed 20261001), the resume rule, the
+infrastructure-failure rule with the 15-minute stall rule and the 10% block rule, the Jev-error stop,
+the metrics and their analysis set, the decision rules (a) (b) (c) (d) with their bounds and p-value,
+the power inputs, the $3 Jev cap per batch, and the commit under test.
+
 ## Corrections
 
 1. 2026-10-01, about 25 minutes after the model-A batch started, before any outcome of a v4
@@ -689,3 +817,137 @@ outcome to choose the concurrency, the timeouts, or the sizes.
    not deciding:** (b) on the trap-capable tasks (families `rules`, `project-only`,
    `decay`, `multi-turn`). **Tooling.** `scripts/thesis-decide.mjs` computes all of this
    from a model's `runs.json`, and `tests/eval-decide.test.ts` checks it on made-up data.
+
+8. 2026-10-24, during the v5 `low` batch, with 552 of the 2,340 runs recorded and before any outcome
+   of a v5 batch was read: no metric, decision-rule bound, or test of a v5 batch had been computed,
+   and `scripts/thesis-decide.mjs` had not run on the batch. The v5 registration set the timeouts from
+   its smoke, three times that smoke's longest run: 66 s for a single-shot run and 435 s for one turn
+   of a multi-turn run. That smoke under-measured the load the batch carries at the same concurrency
+   3: its single-shot mean was 10.8 s and its longest 12 s, while the batch's first repeat averaged
+   17.5 s over 45 single-shot runs, and its 552 recorded runs reach 66 s — a time one uncut run
+   finished in, and the time another was cut at. Both timeouts become three times the longest run of
+   the same kind that was not cut in the 552 runs recorded so far:
+
+   - **Single-shot: 3 x 66 s = 198 s** (`--timeout-min 3.3`). The longest uncut single-shot run is
+     `t2-clip` / `control` / repeat 4, 66 s, `piExit` 0, `testsPass` 7 (run seconds are whole numbers).
+   - **One turn of a multi-turn run: 3 x 203 s = 609 s** (`--arc-timeout-min 10.15`). The longest
+     uncut turn is `t17-clip-arc` / `warden` / repeat 8, turn 4, 203 s of that run's 268 s, exit 0; no
+     turn of any recorded run was cut.
+
+   Everything else stays as registered: 39 repeats, seed 20261001, the 20 tasks and their families,
+   the three cells, concurrency 3, the $3 Jev cap, the analysis set, and decision rules (a) to (d).
+   The runs recorded under the old cap stay in the analysis set unchanged, including the one that cap
+   cut (`t2-clip` / `warden` / repeat 2), which is a task outcome and is analysed as executed; no run
+   is re-executed for the cut, and the batch resumes from its own `runs.json` rather than restarting.
+
+9. 2026-10-25, before the restarted v5 `low` batch's first run and before any outcome of a v5 batch
+   was read: Correction 8's corrected timeouts cannot be applied to a resumed batch. `--timeout-min`
+   and `--arc-timeout-min` are plan keys: the harness refuses a resume whose flag differs from the
+   batch's `runs.json` plan (`--resume: --timeout-min 3.3 differs from the batch's 1.1; a resumed batch
+   keeps its plan`, exit 2), and it rewrites that plan from the stored values after every run. Editing
+   the record by hand would leave a plan block nothing else can verify, and changing the harness in the
+   middle of a batch would change what the rows measure. So the stopped attempt
+   (`eval/reports/2026-10-24-thesis-v5-low`; 552 runs, its plan 1.1 and 7.25) stays exactly as recorded,
+   its 552 runs leave the analysis set and stay on disk as evidence, and the `low` batch restarts from
+   zero in `eval/reports/2026-10-25-thesis-v5-low` under Correction 8's caps: **198 s** for a
+   single-shot run (`--timeout-min 3.3`) and **609 s** for one turn of a multi-turn run
+   (`--arc-timeout-min 10.15`). The restarted batch's plan is then the only protocol its rows were run
+   under. Everything else stays as registered: 39 repeats, seed 20261001, the 20 tasks and their
+   families, the three cells, concurrency 3, the $3 Jev cap, the analysis set, and decision rules
+   (a) to (d).
+
+10. 2026-10-25, with 391 of the 1,920 runs of the v5 `high` batch recorded and before any outcome of a
+   v5 `high` batch was read (no metric, bound or test of a `high` batch had been computed). Correction
+   8's caps cut four arc turns at exactly 609 s in two `warden` runs of those 391: `t16-decay` repeat
+   2, turn 7, and `t20-ship-arc` repeat 3, turns 4, 5 and 6. The uncut arc turns of the same 391 runs
+   put p50 at 49 s, p99 at 128 s and the maximum at 181 s over 590 turns, and no single-shot run came
+   near the 198 s cap (maximum 107 s). The registration's own sizing rule cannot fix this: three times
+   the longest uncut turn is 3 x 181 s = 543 s, under the current 609 s, so it would tighten the cap
+   and cut more. The defect is where both caps sit rather than their size: a cap below the 15-minute
+   stall rule (`--stall-min 15`) cuts a hung run as a timeout, which the registration analyses as a
+   task outcome, so the stall rule can never recognize an infrastructure failure, exclude its block,
+   and re-run it. **Both caps become 20 minutes**: `--timeout-min 20` and `--arc-timeout-min 20`
+   (1,200 s), 300 s above the stall rule, which stays at 15 minutes. A run that keeps producing
+   assistant messages or tool results may then take up to 1,200 s per turn and finish; a run that
+   makes no progress for 15 minutes is killed as a stall, its block is excluded, and it is re-run once
+   ("Resume", Corrections 4). The 391 runs of the stopped attempt
+   (`eval/reports/2026-10-25-thesis-v5-high`) keep their folder as evidence and leave the analysis set;
+   the `high` batch restarts from zero in `eval/reports/2026-10-25-thesis-v5-high-b`. Everything else
+   stays as registered: 32 repeats, seed 20261001, the 20 tasks and their families, the three cells,
+   concurrency 3, the $3 Jev cap, the analysis set, and decision rules (a) to (d).
+
+11. 2026-10-25, with 245 of the 1,920 runs of the v5 `high-b` batch recorded and before any outcome
+   of a `high-c` batch was read (no metric, bound or test of a `high-c` batch had been computed).
+
+   **The stop.** The Commandcode route refused five agent-model calls in a row with its own 429 body.
+   Those five are the `stoppedBy.failures` of `eval/reports/2026-10-25-thesis-v5-high-b/runs.json`, as
+   the harness stores them (it keeps the first 231 characters of the body):
+
+   > `agent model API error: commandcode API error (429): {"message":"You've reached your weekly usage
+   > limit for your plan. Your limit resets at 2026-10-28T09:19:08.820Z. Please wait for the window to
+   > reset or upgrade your plan t`
+
+   The five are `t3-swallow`/`warden`/repeat 5, `t4-stub`/`warden-offline`/repeat 5,
+   `t5-hermetic`/`warden`/repeat 5, and (each with a `turn 1:` prefix) `t16-decay`/`control`/repeat 4,
+   `t20-ship-arc`/`warden-offline`/repeat 4 and `t20-ship-arc`/`control`/repeat 4. Five infrastructure
+   failures in a row stop the batch, as registered ("Infrastructure failures"), so the batch stopped
+   with 245 runs of 1,920 recorded. Nothing else was wrong with those 245: `timedOut` is false in every
+   one of them, not one recovered a provider error, and every one has `piExit` 0. The quota is weekly:
+   the route cannot run again before 2026-10-28T09:19:08Z, three days after the stop.
+
+   **Why the batch restarts instead of resuming.** The harness freezes a batch's plan in the batch's
+   own record and a resumed batch keeps its plan's model; a resume that names another model is refused
+   rather than mixed in. Correction 10's caps therefore cannot reach a resumed `high-b` either, so the
+   rule of Corrections 9 and 10 holds again: the 245 recorded runs leave the analysis set, stay on disk
+   untouched as evidence in `eval/reports/2026-10-25-thesis-v5-high-b`, and one clean batch carries one
+   protocol.
+
+   **What changes: the route only.** The `high` batch runs model B as
+   `river/deepseek-ai/DeepSeek-V4.1-Flash-1017` through the River provider extension, in
+   `eval/reports/2026-10-25-thesis-v5-high-c`. The provider extension is named on every launch and
+   every resume, because the extension list is not part of a batch's stored plan.
+
+   **What does not change.** 32 repeats, seed 20261001, the same 20 tasks and their families, the three
+   cells (`control`, `warden`, `warden-offline`), concurrency 3, 12 turns, the SubQ Jev backend at
+   $0.05 per 1M input tokens, the $3 Jev cap, Correction 10's caps (`--timeout-min 20`,
+   `--arc-timeout-min 20`) and the 15-minute stall rule, the analysis set, the metrics, and decision
+   rules (a) to (d). No registered number moves: one correction for one measured defect.
+
+   **The two catalog entries, side by side** (both read from `pi --list-models` on 2026-10-25):
+
+   | | `commandcode/deepseek/deepseek-v4.1-flash` | `river/deepseek-ai/DeepSeek-V4.1-Flash-1017` |
+   |---|---|---|
+   | context window | 1,000,000 | 1,048,576 |
+   | maximum output tokens | 65,536 | 384,000 |
+   | thinking levels the catalog offers | the map carries `high` | `none`, `high` and `max`; `low` is `null` |
+   | agent price per 1M tokens | DeepSeek's own rates as an equivalent | River's published flat rates: 0.12 in, 0.48 out, 0.0024 cache-read, 0 cache-write |
+   | thinking `high` accepted | measured, the 245 runs of `high-b` | measured in the smoke, from each run's own session log |
+
+   Neither ceiling cut a run of `high-b`: no run recorded a timeout and no call was refused for
+   length, so the wider ceiling of the River route changes nothing that is measured here. It stays a
+   property of the route, not a change to the task.
+
+   **Measured or assumed.** That River serves the same DeepSeek V4.1 Flash weights is **assumed**:
+   nothing on this machine proves it. The route check in the `high-c` report compares `high-b` and
+   `high-c` task by task and cell by cell, and states whether the route moved the metrics; it is
+   descriptive, it guards the level comparison, and it decides nothing. River's rate limits are
+   **assumed** generous: the first chunks measure them, and a River quota or capacity error stops the
+   batch exactly as the Commandcode one did, reported with the provider's own message, without raising
+   any cap, without switching route again and without retrying past what the runner already does.
+
+   **The `low` level stays where it is.** River's thinking map for this model carries `low: null`, and
+   River rejects a level it does not serve, so `low` is measured absent on this route and is not an
+   option for this batch: the `low` batch (`eval/reports/2026-10-25-thesis-v5-low`) stays on the
+   Commandcode route. Model B is therefore the `high` level of the model on a second route, and the
+   two levels are never pooled.
+
+12. 2026-10-25, with 1,734 of the 1,920 runs of the `high-c` batch recorded and after the batch had
+   stopped on a failed judgment: `t17-clip-arc` `warden` repeat 29 got `HTTP 422` from SubQ at
+   2026-10-25T21:53:17.393Z ("TypeSafe returned HTTP 422. Check the question format and model limits. No
+   automatic retry was made."), its run was not counted, and the runner exited with code 3, as the
+   "Jev-error stop" section requires (the failure is `http`, not `aborted`, so Corrections 2's cancelled
+   trace sample does not apply; it is the only failed judgment in the batch's 640 warden ledgers). The
+   owner decided to resume. The batch resumed in the same folder with the same plan and the same
+   provider extension, the stopped run re-ran as one of the pending plan rows and counted, and the
+   batch reached all 1,920 runs with no excluded block. No registered number changes; the stop stays in
+   `eval/reports/2026-10-25-thesis-v5-high-c/runs.json` under `stops`, and the report names it.
