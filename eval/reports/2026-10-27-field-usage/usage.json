@@ -36,16 +36,16 @@
   "steers": {
     "total": 3024,
     "byKind": {
-      "rules": 598,
+      "rules": 613,
       "credential notice": 400,
       "intent mismatch": 397,
       "open loops": 395,
-      "slop": 341,
+      "slop": 340,
       "done-check": 255,
       "stuck": 242,
-      "other": 137,
+      "other": 124,
       "security": 83,
-      "needs user input": 59,
+      "needs user input": 58,
       "prose trend": 27,
       "tool or skill reminder": 25,
       "off-task": 25,
@@ -61,8 +61,8 @@
     "noCheck": 73
   },
   "rules": {
-    "steers": 598,
-    "distinctRules": 48,
+    "steers": 613,
+    "distinctRules": 49,
     "countsPerRuleTopFirst": [
       90,
       65,
@@ -73,7 +73,7 @@
       32,
       31,
       31,
-      15,
+      27,
       14,
       13,
       12,
@@ -88,6 +88,7 @@
       4,
       4,
       4,
+      3,
       3,
       3,
       2,

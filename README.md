@@ -14,7 +14,7 @@
 
 </div>
 
-![pi-warden tells the agent what it got wrong and the agent fixes it: told 255 times that it said done with nothing checked, the agent ran a check next 182 times (71%); of 276 held actions with a known outcome, the agent found a safer way 235 times, you approved 30, you said no 11 times; 598 steers named a project rule; 3,350 real sessions, 2026-09-16 to 2026-10-26](https://raw.githubusercontent.com/DevMortimer/pi-warden/main/docs/hero.png)
+![pi-warden tells the agent what it got wrong and the agent fixes it: told 255 times that it said done with nothing checked, the agent ran a check next 182 times (71%); of 276 held actions with a known outcome, the agent found a safer way 235 times, you approved 30, you said no 11 times; 613 steers named a project rule; 3,350 real sessions, 2026-09-16 to 2026-10-26](https://raw.githubusercontent.com/DevMortimer/pi-warden/main/docs/hero.png)
 
 <div align="center">
 

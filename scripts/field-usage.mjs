@@ -33,7 +33,8 @@ const STEER_KINDS = [
   ["intent mismatch", /something different from what you said/],
   ["credential notice", /Possible credentials/],
   ["stuck", /same call (?:succeeded|failed)|called \d+ times with|failures with the same strategy/],
-  ["rules", /(?:content just written to .*|change to .* \(made by a command, not an edit\)|changes this run made) violates? (?:a )?project rules?/],
+  // A rule from a fallback rules file (README, AGENTS) says "breaks a project rule"; before 0.65.1 it said "breaks a rule stated in <files>".
+  ["rules", /(?:content just written to .*|change to .* \(made by a command, not an edit\)|changes this run made) (?:violates? (?:a )?project rules?|breaks a (?:project rule|rule stated in))/],
   ["slop", /stub or placeholder|restate the code|dead or duplicated|hedging|vague notes/],
   ["needs user input", /may need user input/],
   ["runaway", /stopped your reply/],
@@ -96,7 +97,7 @@ for (const file of sessionFiles(sessionsDir)) {
       const kind = kindOf(text);
       count(steers, kind);
       if (kind === "rules") {
-        const name = /pi-warden\.md: "([^"]+)"|project rules?: "([^"]+)"/.exec(text)?.slice(1).find(Boolean);
+        const name = /pi-warden\.md: "([^"]+)"|project rules?: "([^"]+)"|rule stated in [^:"]+: "([^"]+)"/.exec(text)?.slice(1).find(Boolean);
         if (name) count(rules, name);
       }
       if (kind === "done-check") {

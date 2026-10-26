@@ -21,8 +21,8 @@ const numbers = {
   holdsSaferRoute: 235,       // FIELD line 24: "the agent took a safer route 235 times"
   holdsApproved: 30,          // FIELD line 24: "the user approved 30"
   holdsDeclined: 11,          // FIELD line 24: "and declined 11"
-  ruleSteers: 598,            // FIELD line 26: "598 steers named a project rule, spread over 48 rules"
-  rulesDistinct: 48,          // FIELD line 26: same sentence
+  ruleSteers: 613,            // FIELD line 26: "613 steers named a project rule, spread over 49 rules"
+  rulesDistinct: 49,          // FIELD line 26: same sentence
   doneSteerScore: '0.99',     // eval/reports/2026-09-26-waste-nudges/report.md line 166: "reports completion (0.99) after 1 file change"
   ruleSteerScore: '0.88',     // docs/examples.md line 20: "No hardcoded secrets" (0.88)
 };

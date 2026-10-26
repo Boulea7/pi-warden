@@ -13,7 +13,8 @@ guard.
 
 Not batches: counts from real Pi sessions, produced by `scripts/field-usage.mjs`.
 
-- [2026-10-01-field-usage](2026-10-01-field-usage/README.md): sixteen days, 1,168 sessions, 53,868 judged actions, what worked and what was noise. The source of the README numbers.
+- [2026-10-27-field-usage](2026-10-27-field-usage/README.md): forty-one days, 3,350 sessions, 184,249 judged actions, what worked and what was noise. The source of the README numbers.
+- [2026-10-01-field-usage](2026-10-01-field-usage/README.md): sixteen days, 1,168 sessions, 53,868 judged actions, what worked and what was noise. Superseded by the report above.
 - [2026-09-24-field-usage](2026-09-24-field-usage/README.md): nine days, 759 sessions, 23,664 judged actions, what worked and what was noise. Superseded by the report above.
 - [2026-09-26-judge-bench](2026-09-26-judge-bench/README.md) (judge bench, `npm run eval:judge`, not a batch): 80 labelled stuck and done cases in three request states, 3 repeats. Structured evidence beats today's stuck state on 11 cases to 0 (p = 0.001); done shows no gain beyond noise because a passing check skips the judge; more raw bytes change nothing.
 - [2026-09-26-stuck-evidence](2026-09-26-stuck-evidence/report.md) (judge bench, `npm run eval:judge`, not a batch): the same 80 cases and one repeat, after the structured evidence shipped in the guard. The stuck state is now the shipped builder with `stuck.evidence` on and the baseline is the same builder with it off, so the two differ by one config switch: accuracy 0.725 → 1.000, the same 11 cases to 0 (p = 0.001), the four noise traps at 1.00 in both, +1.5 KB and no latency change at p50.
