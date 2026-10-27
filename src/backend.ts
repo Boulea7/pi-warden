@@ -1,6 +1,11 @@
-import type { Fetch } from "@typesafe-ai/sdk";
 import type { BackendSpec, TypeSafeOptions } from "pi-typesafe";
 import { DEFAULT_BACKEND, backendHost, resolveBackend } from "pi-typesafe";
+
+/**
+ * The TS SDK's transport type, declared here because that SDK is not a dependency this package declares.
+ * Byte-for-byte the shape pi-typesafe's `TypeSafeOptions.fetch` accepts (that SDK's dist/index.d.cts:239).
+ */
+type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
 /** The judgment backend: a registry name ("typesafe", "openrouter", "commandcode") or a caller-supplied endpoint object. */
 export type JudgmentBackend = BackendSpec;

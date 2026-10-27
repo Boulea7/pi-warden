@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { DECISIONS_BACKENDS } from "pi-typesafe";
+import { DECISIONS_BACKENDS, createTypeSafe, noul, openUsageLedger } from "pi-typesafe";
 import { backendName, bufferedFetch, describeBackend, disclosureFor, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
 
 const gateway = { label: "Acme judge gateway", host: "https://gw.acme.example", path: "/judge/v1/decide", keyEnv: "ACME_JUDGE_KEY", defaultModel: "jev-1.13" };
@@ -134,5 +137,38 @@ test("backend hosts come from pi-typesafe's registry, not a local copy", () => {
   for (const backend of ["typesafe", "openrouter", "commandcode"] as const) {
     const host = new URL(DECISIONS_BACKENDS[backend].host).host;
     assert.match(describeBackend(backend), new RegExp(host.replace(/[.]/g, "\\.")));
+  }
+});
+
+test("createTypeSafe(judgeOptions) sends a real judgment and parses the answer on this runtime", async () => {
+  // The SDK's attempt() arms a timeout signal on every request and then buffers the response; on Bun,
+  // that buffering used to leave the body unreadable, so this is the call that regressed.
+  const answer = { model: "jev-1.13", answers: { risky: { type: "noul", noul: 0.42 } }, usage: { input_tokens: 10, output_tokens: 1 } };
+  const seen: { url: string | undefined; body: unknown } = { url: undefined, body: undefined };
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      seen.url = request.url;
+      seen.body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(answer));
+    });
+  }).listen(0);
+  const dir = mkdtempSync(join(tmpdir(), "pi-warden-judge-transport-"));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const judge = createTypeSafe({
+      ...judgeOptions({ maxRequests: 2, timeoutMs: 5000, typesafeBackend: { label: "Local judge", host: `http://127.0.0.1:${port}`, keyEnv: "LOCAL_JUDGE_KEY", defaultModel: "jev-1.13" } }),
+      apiKey: "local-test-key",
+      ledger: openUsageLedger({ path: join(dir, "usage.json") }),
+    });
+    const result = await judge.evaluate({ state: "Approve this pull request", questions: { risky: noul("Is this change risky?") } });
+    assert.equal(result.answers.risky.noul, 0.42, "the parsed answer comes back, so the transport left the body readable");
+    assert.equal(seen.url, "/v1/systemone");
+    assert.equal((seen.body as { model?: string }).model, "jev-1.13");
+  } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
