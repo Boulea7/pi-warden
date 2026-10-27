@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { DECISIONS_BACKENDS } from "pi-typesafe";
-import { backendName, describeBackend, disclosureFor, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
+import { backendName, bufferedFetch, describeBackend, disclosureFor, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
 
 const gateway = { label: "Acme judge gateway", host: "https://gw.acme.example", path: "/judge/v1/decide", keyEnv: "ACME_JUDGE_KEY", defaultModel: "jev-1.13" };
 
@@ -80,6 +82,52 @@ test("judgeOptions: commandcode and openrouter are forwarded as names", () => {
 test("judgeOptions: an endpoint object reaches createTypeSafe unchanged", () => {
   const opts = judgeOptions({ maxRequests: 10, timeoutMs: 3000, typesafeBackend: gateway });
   assert.equal(opts.backend, gateway);
+});
+
+test("judgeOptions on Bun carries a fetch that keeps the SDK out of the body stream; on Node it adds nothing", () => {
+  const onBun = process.versions?.bun !== undefined;
+  const opts = judgeOptions({ maxRequests: 10, timeoutMs: 3000, typesafeBackend: gateway });
+  assert.equal(typeof opts.fetch, onBun ? "function" : "undefined", "the transport is injected only where the SDK's buffering breaks responses");
+});
+
+test("bufferedFetch: a response whose clone() has no body survives the SDK's buffering, and its body stays readable", async () => {
+  const body = JSON.stringify({ model: "jev-1.13-free", answers: { q1: { type: "noul", noul: 0.42 } }, usage: { input_tokens: 10, output_tokens: 1 } });
+  const server = createServer((request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(body);
+  }).listen(0);
+  try {
+    const { port } = server.address() as AddressInfo;
+    // The SDK's attempt() attaches a signal for its timeout, and its bufferResponse() drains a
+    // clone first. Reproduce both, then the parseBody() read that Bun breaks.
+    const controller = new AbortController();
+    const fetch = bufferedFetch();
+    const response = await fetch(`http://127.0.0.1:${port}/judge`, { signal: controller.signal });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/json");
+    const reader = response.clone().body?.getReader();
+    assert.equal(reader, undefined, "the clone has no body, so the SDK's buffering returns early instead of locking the original stream");
+    const parsed = JSON.parse(await response.text());
+    assert.equal(parsed.answers.q1.noul, 0.42, "the original body stays readable after the buffering step");
+  } finally {
+    server.close();
+  }
+});
+
+test("bufferedFetch: a non-2xx body still parses, and its status and headers pass through", async () => {
+  const server = createServer((request, response) => {
+    response.writeHead(422, { "content-type": "application/json", "retry-after": "2" });
+    response.end('{"error":{"message":"bad"}}');
+  }).listen(0);
+  try {
+    const { port } = server.address() as AddressInfo;
+    const response = await bufferedFetch()(`http://127.0.0.1:${port}/judge`, {});
+    assert.equal(response.status, 422);
+    assert.equal(response.headers.get("retry-after"), "2");
+    assert.equal(JSON.parse(await response.text()).error.message, "bad");
+  } finally {
+    server.close();
+  }
 });
 
 test("backend hosts come from pi-typesafe's registry, not a local copy", () => {
