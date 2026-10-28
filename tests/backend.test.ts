@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DECISIONS_BACKENDS, TypeSafeIntegrationError, createTypeSafe, noul, openUsageLedger } from "pi-typesafe";
-import { backendName, bufferedFetch, describeBackend, disclosureFor, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
+import { backendName, describeBackend, disclosureFor, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
 
 const gateway = { label: "Acme judge gateway", host: "https://gw.acme.example", path: "/judge/v1/decide", keyEnv: "ACME_JUDGE_KEY", defaultModel: "jev-1.13" };
 
@@ -87,50 +87,10 @@ test("judgeOptions: an endpoint object reaches createTypeSafe unchanged", () => 
   assert.equal(opts.backend, gateway);
 });
 
-test("judgeOptions on Bun carries a fetch that keeps the SDK out of the body stream; on Node it adds nothing", () => {
+test("judgeOptions carries no fetch on either runtime, so the body replay stays pi-typesafe's job", () => {
   const onBun = process.versions?.bun !== undefined;
   const opts = judgeOptions({ maxRequests: 10, timeoutMs: 3000, typesafeBackend: gateway });
-  assert.equal(typeof opts.fetch, onBun ? "function" : "undefined", "the transport is injected only where the SDK's buffering breaks responses");
-});
-
-test("bufferedFetch: a response whose clone() has no body survives the SDK's buffering, and its body stays readable", async () => {
-  const body = JSON.stringify({ model: "jev-1.13-free", answers: { q1: { type: "noul", noul: 0.42 } }, usage: { input_tokens: 10, output_tokens: 1 } });
-  const server = createServer((request, response) => {
-    response.writeHead(200, { "content-type": "application/json" });
-    response.end(body);
-  }).listen(0);
-  try {
-    const { port } = server.address() as AddressInfo;
-    // The SDK's attempt() attaches a signal for its timeout, and its bufferResponse() drains a
-    // clone first. Reproduce both, then the parseBody() read that Bun breaks.
-    const controller = new AbortController();
-    const fetch = bufferedFetch();
-    const response = await fetch(`http://127.0.0.1:${port}/judge`, { signal: controller.signal });
-    assert.equal(response.status, 200);
-    assert.equal(response.headers.get("content-type"), "application/json");
-    const reader = response.clone().body?.getReader();
-    assert.equal(reader, undefined, "the clone has no body, so the SDK's buffering returns early instead of locking the original stream");
-    const parsed = JSON.parse(await response.text());
-    assert.equal(parsed.answers.q1.noul, 0.42, "the original body stays readable after the buffering step");
-  } finally {
-    server.close();
-  }
-});
-
-test("bufferedFetch: a non-2xx body still parses, and its status and headers pass through", async () => {
-  const server = createServer((request, response) => {
-    response.writeHead(422, { "content-type": "application/json", "retry-after": "2" });
-    response.end('{"error":{"message":"bad"}}');
-  }).listen(0);
-  try {
-    const { port } = server.address() as AddressInfo;
-    const response = await bufferedFetch()(`http://127.0.0.1:${port}/judge`, {});
-    assert.equal(response.status, 422);
-    assert.equal(response.headers.get("retry-after"), "2");
-    assert.equal(JSON.parse(await response.text()).error.message, "bad");
-  } finally {
-    server.close();
-  }
+  assert.equal("fetch" in opts, false, `on ${onBun ? "Bun" : "Node"}: a transport here would be a second copy of pi-typesafe's own body replay`);
 });
 
 test("backend hosts come from pi-typesafe's registry, not a local copy", () => {
@@ -141,11 +101,12 @@ test("backend hosts come from pi-typesafe's registry, not a local copy", () => {
 });
 
 test("createTypeSafe(judgeOptions) sends a real judgment and parses the answer on this runtime", async () => {
-  // The SDK's attempt() arms a timeout signal on every request and then buffers the response; on Bun,
-  // that buffering used to leave the body unreadable, so this is the call that regressed.
+  // The SDK's attempt() arms a timeout signal and then buffers the response; on Bun that buffering used to leave the
+  // body unreadable, so this is the call that notices if pi-typesafe's replay (0.13.1) breaks.
   const answer = { model: "jev-1.13", answers: { risky: { type: "noul", noul: 0.42 } }, usage: { input_tokens: 10, output_tokens: 1 } };
-  const seen: { url: string | undefined; body: unknown } = { url: undefined, body: undefined };
+  const seen: { url: string | undefined; body: unknown; requests: number } = { url: undefined, body: undefined, requests: 0 };
   const server = createServer((request, response) => {
+    seen.requests += 1;
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
     request.on("end", () => {
@@ -167,6 +128,7 @@ test("createTypeSafe(judgeOptions) sends a real judgment and parses the answer o
     assert.equal(result.answers.risky.noul, 0.42, "the parsed answer comes back, so the transport left the body readable");
     assert.equal(seen.url, "/v1/systemone");
     assert.equal((seen.body as { model?: string }).model, "jev-1.13");
+    assert.equal(seen.requests, 1, "one judgment, one request: pi-typesafe builds its client with no retries");
   } finally {
     server.close();
     rmSync(dir, { recursive: true, force: true });
@@ -174,9 +136,9 @@ test("createTypeSafe(judgeOptions) sends a real judgment and parses the answer o
 });
 
 test("a judge that accepts the request and never answers still times out on this runtime", async () => {
-  // The shim reads the body itself before handing the response back, so a server that answers the
-  // headers and never ends the body is the one path where its own body read could swallow the SDK's
-  // timeout. The abort has to reach that read and reject the call, on Node and on Bun alike.
+  // pi-typesafe's replay reads the body itself before handing the response back, so a server that answers the
+  // headers and never ends the body is the one path where that read could swallow the SDK's timeout. The abort has
+  // to reach the read and reject the call, on Node and on Bun alike.
   let requests = 0;
   const held = new Set<Socket>();
   const server = createServer(() => {
