@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { FILE_BYTES } from "./hosts/io.js";
+import { FILE_BYTES, HostFileError } from "./hosts/io.js";
 
 async function readInput(signal: AbortSignal): Promise<unknown> {
   return new Promise((done, reject) => {
@@ -58,8 +58,10 @@ async function main(): Promise<void> {
       return;
     }
     throw new Error("Usage: pi-warden hook claude <event> | init claude [--project] | uninstall claude [--project]");
-  } catch {
-    process.stderr.write(command === "hook" ? "pi-warden: rules check skipped; invalid input, unavailable state or judge, or hook deadline.\n" : "pi-warden: settings could not be changed; check the JSON, receipt and file permissions.\n");
+  } catch (error) {
+    process.stderr.write(command === "hook" ? "pi-warden: rules check skipped; invalid input, unavailable state or judge, or hook deadline.\n"
+      : error instanceof HostFileError ? `pi-warden: ${error.message}\n`
+      : "pi-warden: settings could not be changed; check the JSON, receipt and file permissions.\n");
     process.exitCode = command === "hook" ? 0 : 1;
   }
 }

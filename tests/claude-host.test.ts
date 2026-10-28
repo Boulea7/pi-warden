@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -17,6 +18,13 @@ async function fixture(): Promise<{ root: string; project: string; agent: string
   const agent = join(root, "agent");
   await mkdir(join(project, ".claude"), { recursive: true });
   return { root, project, agent, settings: join(project, ".claude", "settings.json") };
+}
+
+async function receiptPath(fx: Awaited<ReturnType<typeof fixture>>): Promise<string> {
+  const directory = join(fx.agent, "pi-warden", "hosts", "claude");
+  const files = await readdir(directory);
+  assert.equal(files.length, 1);
+  return join(directory, files[0]!);
 }
 
 async function cli(fx: Awaited<ReturnType<typeof fixture>>, args: string[], input = "{}", env: NodeJS.ProcessEnv = {}, entry = CLI): Promise<{ code: number | null; stdout: string; stderr: string }> {
@@ -66,6 +74,85 @@ test("the CLI runs through an npm-style bin symlink", async () => {
     const settings = JSON.parse(await readFile(fx.settings, "utf8"));
     assert.ok(settings.hooks.PostToolUse.some((group: { hooks: Array<{ command: string }> }) => group.hooks.some(hook => hook.command === "pi-warden hook claude PostToolUse")));
   } finally { await rm(fx.root, { recursive: true, force: true }); }
+});
+
+test("symlinked Claude settings are refused with their path and reason without changing the link or target", { skip: process.platform === "win32" }, async () => {
+  for (const project of [false, true]) {
+    for (const command of ["init", "uninstall"]) {
+      for (const dangling of [false, true]) {
+        const fx = await fixture();
+        try {
+          await mkdir(join(fx.root, ".claude"));
+          const settings = project ? fx.settings : join(fx.root, ".claude", "settings.json");
+          const args = [command, "claude", ...(project ? ["--project"] : [])];
+          const env = { HOME: fx.root };
+          await writeFile(settings, JSON.stringify({ permissions: { allow: ["Read"] }, private: "PRIVATE_SETTINGS_VALUE" }));
+          if (command === "uninstall") assert.equal((await cli(fx, ["init", ...args.slice(1)], "{}", env)).code, 0);
+          const receipt = command === "uninstall" ? await receiptPath(fx) : undefined;
+          const priorReceipt = receipt ? await readFile(receipt, "utf8") : undefined;
+          const text = await readFile(settings, "utf8");
+          const target = join(fx.root, "dotfiles-settings.json");
+          if (!dangling) await writeFile(target, text);
+          await rm(settings);
+          await symlink(target, settings);
+          const result = await cli(fx, args, "{}", env);
+          assert.notEqual(result.code, 0);
+          assert.equal(result.stdout, "");
+          assert.equal(await readlink(settings), target);
+          if (dangling) await assert.rejects(readFile(target, "utf8"), { code: "ENOENT" });
+          else assert.equal(await readFile(target, "utf8"), text);
+          if (receipt) assert.equal(await readFile(receipt, "utf8"), priorReceipt);
+          else await assert.rejects(readdir(join(fx.agent, "pi-warden", "hosts", "claude")), { code: "ENOENT" });
+          assert.match(result.stderr, /symbolic link/i);
+          assert.ok(result.stderr.includes(JSON.stringify(settings)));
+          assert.doesNotMatch(result.stderr, /PRIVATE_SETTINGS_VALUE/);
+        } finally { await rm(fx.root, { recursive: true, force: true }); }
+      }
+    }
+  }
+});
+
+test("invalid installation receipts are diagnosed by their path without echoing their contents", async () => {
+  for (const corrupt of ["PRIVATE_RECEIPT_JSON", '{"version":2,"private":"PRIVATE_RECEIPT_JSON"}']) {
+    for (const command of ["init", "uninstall"]) {
+      const fx = await fixture();
+      try {
+        assert.equal((await cli(fx, ["init", "claude", "--project"])).code, 0);
+        const receipt = await receiptPath(fx);
+        const settings = await readFile(fx.settings, "utf8");
+        await writeFile(receipt, corrupt);
+        const result = await cli(fx, [command, "claude", "--project"]);
+        assert.notEqual(result.code, 0);
+        assert.match(result.stderr, /invalid.*installation receipt/i);
+        assert.ok(result.stderr.includes(JSON.stringify(receipt)));
+        assert.doesNotMatch(result.stderr, /PRIVATE_RECEIPT/);
+        assert.equal(await readFile(receipt, "utf8"), corrupt);
+        assert.equal(await readFile(fx.settings, "utf8"), settings);
+      } finally { await rm(fx.root, { recursive: true, force: true }); }
+    }
+  }
+});
+
+test("invalid settings groups are rejected before a pending receipt can change", async () => {
+  for (const command of ["init", "uninstall"]) {
+    const fx = await fixture();
+    try {
+      assert.equal((await cli(fx, ["init", "claude", "--project"])).code, 0);
+      const receipt = await receiptPath(fx);
+      const settings = JSON.stringify({ hooks: { PostToolUse: "PRIVATE_INVALID_HOOKS" } });
+      const pending = { before: "unmatched-before", after: createHash("sha256").update(JSON.stringify([settings])).digest("hex"), added: [] };
+      const prior = JSON.stringify({ ...JSON.parse(await readFile(receipt, "utf8")), pending });
+      await writeFile(fx.settings, settings);
+      await writeFile(receipt, prior);
+      const result = await cli(fx, [command, "claude", "--project"]);
+      assert.notEqual(result.code, 0);
+      assert.equal(await readFile(fx.settings, "utf8"), settings);
+      assert.equal(await readFile(receipt, "utf8"), prior);
+      assert.match(result.stderr, /invalid.*settings hooks/i);
+      assert.ok(result.stderr.includes(JSON.stringify(fx.settings)));
+      assert.doesNotMatch(result.stderr, /PRIVATE_INVALID_HOOKS/);
+    } finally { await rm(fx.root, { recursive: true, force: true }); }
+  }
 });
 
 async function judgeProject(fx: Awaited<ReturnType<typeof fixture>>, overrides: Record<string, unknown> = {}): Promise<NodeJS.ProcessEnv> {
@@ -413,10 +500,14 @@ test("disabled rules and gitignored files send no request", async () => {
 test("invalid settings JSON is preserved and invalid or oversized hook input is never echoed", async () => {
   const fx = await fixture();
   try {
-    const broken = "{ broken settings";
+    const broken = "PRIVATE_SETTINGS_JSON";
     await writeFile(fx.settings, broken);
     for (const command of ["init", "uninstall"]) {
-      assert.notEqual((await cli(fx, [command, "claude", "--project"])).code, 0);
+      const result = await cli(fx, [command, "claude", "--project"]);
+      assert.notEqual(result.code, 0);
+      assert.match(result.stderr, /invalid.*JSON/i);
+      assert.ok(result.stderr.includes(JSON.stringify(fx.settings)));
+      assert.doesNotMatch(result.stderr, /PRIVATE_SETTINGS/);
       assert.equal(await readFile(fx.settings, "utf8"), broken);
     }
     for (const input of ["{secret: sk-fixture-not-a-secret}", "x".repeat(1024 * 1024 + 1)]) {
@@ -477,7 +568,11 @@ test("installation recovers after settings or final receipt persistence fails", 
     const fx = await fixture();
     try {
       await writeFile(fx.settings, JSON.stringify({ preserved: true }));
-      assert.notEqual((await cli(fx, ["init", "claude", "--project"], "{}", { [failure]: "1" })).code, 0);
+      const result = await cli(fx, ["init", "claude", "--project"], "{}", { [failure]: "1" });
+      assert.notEqual(result.code, 0);
+      assert.match(result.stderr, /permission denied/i);
+      assert.ok(result.stderr.includes(JSON.stringify(failure === "CLAUDE_TEST_SETTINGS_FAIL" ? fx.settings : await receiptPath(fx))));
+      assert.doesNotMatch(result.stderr, /Fixture (?:settings|receipt) failure/);
       assert.equal((await cli(fx, ["init", "claude", "--project"])).code, 0);
       assert.equal((await cli(fx, ["uninstall", "claude", "--project"])).code, 0);
       assert.deepEqual(JSON.parse(await readFile(fx.settings, "utf8")), { preserved: true });
@@ -568,7 +663,7 @@ test("backend question chunks each consume a session slot across fresh hooks", a
   } finally { await rm(fx.root, { recursive: true, force: true }); }
 });
 
-test("a stalled git ignore child is killed and reaped before the hook returns", { skip: process.platform === "win32" }, async () => {
+test("a stalled direct git ignore child is killed and reaped before the hook returns", { skip: process.platform === "win32" }, async () => {
   const fx = await fixture();
   try {
     const env = await judgeProject(fx);
