@@ -1,6 +1,12 @@
 import type { BackendSpec, TypeSafeOptions } from "pi-typesafe";
 import { DEFAULT_BACKEND, backendHost, resolveBackend } from "pi-typesafe";
 
+/**
+ * The TS SDK's transport type, declared here because that SDK is not a dependency this package declares.
+ * Byte-for-byte the shape pi-typesafe's `TypeSafeOptions.fetch` accepts (that SDK's dist/index.d.cts:239).
+ */
+type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
+
 /** The judgment backend: a registry name ("typesafe", "openrouter", "commandcode") or a caller-supplied endpoint object. */
 export type JudgmentBackend = BackendSpec;
 
@@ -59,11 +65,48 @@ export function disclosureFor(backend: JudgmentBackend | undefined, disclosure: 
 /**
  * Build the options forwarded to `createTypeSafe`.
  * The caller must gate on `authState({ backend }).usable` before calling `createTypeSafe`.
+ * On Bun (the runtime Pi ships as), the SDK's response buffering breaks every judge call, so the
+ * options carry a fetch that keeps it out of the body stream.
  */
 export function judgeOptions(config: { maxRequests: number; timeoutMs: number; typesafeBackend: JudgmentBackend }): TypeSafeOptions {
   return {
     maxRequests: config.maxRequests,
     timeoutMs: config.timeoutMs,
     ...(config.typesafeBackend === DEFAULT_BACKEND ? {} : { backend: config.typesafeBackend }),
+    ...(bunRuntime() ? { fetch: bufferedFetch() } : {}),
   };
+}
+
+/** Whether this process runs on Bun, the runtime Pi's compiled binary embeds. */
+function bunRuntime(): boolean {
+  return typeof process !== "undefined" && process.versions?.bun !== undefined;
+}
+
+/**
+ * On Bun, the SDK's timeout wrapper attaches an AbortSignal to every fetch, and its buffering step
+ * (`bufferResponse`) then acquires a ReadableStream reader on the original response body, releasing
+ * it without reading. Bun marks a response body used as soon as any reader is acquired, so the SDK's
+ * own later `res.text()` throws `TypeError: Body already used`, which
+ * pi-typesafe reports as a "response" failure — every judgment fails. This transport reads the
+ * body itself, inside the caller's signal window, and hands back a buffered response whose
+ * `clone()` has no body: the SDK's buffering step sees no reader to take and returns early, never
+ * locking the original stream. Timeouts still reject: the abort errors the body read here.
+ */
+export function bufferedFetch(base: Fetch = fetch as unknown as Fetch): Fetch {
+  return (input, init) =>
+    base(input, init).then(async (response) => {
+      const text = await response.text();
+      const headers = new Headers(response.headers);
+      // The wire encoding is decoded and the byte length can differ, so neither still describes the body.
+      headers.delete("content-encoding");
+      headers.delete("content-length");
+      const buffered = new Response(text, { status: response.status, statusText: response.statusText, headers });
+      return new Proxy(buffered, {
+        get(target, property) {
+          if (property === "clone") return () => new Response(null, { status: target.status, statusText: target.statusText, headers: target.headers });
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }) as Promise<Response>;
 }
