@@ -85,8 +85,8 @@ function bunRuntime(): boolean {
 /**
  * On Bun, the SDK's timeout wrapper attaches an AbortSignal to every fetch, and its buffering step
  * (`bufferResponse`) then acquires a ReadableStream reader on the original response body, releasing
- * it without reading. A signal-attached Bun response is marked used the moment any reader is
- * acquired, so the SDK's own later `res.text()` throws `TypeError: Body already used`, which
+ * it without reading. Bun marks a response body used as soon as any reader is acquired, so the SDK's
+ * own later `res.text()` throws `TypeError: Body already used`, which
  * pi-typesafe reports as a "response" failure — every judgment fails. This transport reads the
  * body itself, inside the caller's signal window, and hands back a buffered response whose
  * `clone()` has no body: the SDK's buffering step sees no reader to take and returns early, never

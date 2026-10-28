@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { DECISIONS_BACKENDS, createTypeSafe, noul, openUsageLedger } from "pi-typesafe";
+import { DECISIONS_BACKENDS, TypeSafeIntegrationError, createTypeSafe, noul, openUsageLedger } from "pi-typesafe";
 import { backendName, bufferedFetch, describeBackend, disclosureFor, judgeOptions, loginStoresKey, resolveJudgmentBackend } from "../src/backend.js";
 
 const gateway = { label: "Acme judge gateway", host: "https://gw.acme.example", path: "/judge/v1/decide", keyEnv: "ACME_JUDGE_KEY", defaultModel: "jev-1.13" };
@@ -168,6 +168,46 @@ test("createTypeSafe(judgeOptions) sends a real judgment and parses the answer o
     assert.equal(seen.url, "/v1/systemone");
     assert.equal((seen.body as { model?: string }).model, "jev-1.13");
   } finally {
+    server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a judge that accepts the request and never answers still times out on this runtime", async () => {
+  // The shim reads the body itself before handing the response back, so a server that answers the
+  // headers and never ends the body is the one path where its own body read could swallow the SDK's
+  // timeout. The abort has to reach that read and reject the call, on Node and on Bun alike.
+  let requests = 0;
+  const held = new Set<Socket>();
+  const server = createServer(() => {
+    requests += 1;
+    // Accept the request and never answer it.
+  });
+  server.on("connection", (socket: Socket) => {
+    held.add(socket);
+    socket.on("close", () => held.delete(socket));
+  });
+  server.listen(0);
+  const dir = mkdtempSync(join(tmpdir(), "pi-warden-judge-timeout-"));
+  try {
+    const { port } = server.address() as AddressInfo;
+    const judge = createTypeSafe({
+      ...judgeOptions({ maxRequests: 2, timeoutMs: 150, typesafeBackend: { label: "Silent judge", host: `http://127.0.0.1:${port}`, keyEnv: "LOCAL_JUDGE_KEY", defaultModel: "jev-1.13" } }),
+      apiKey: "local-test-key",
+      ledger: openUsageLedger({ path: join(dir, "usage.json") }),
+    });
+    await assert.rejects(
+      judge.evaluate({ state: "Approve this pull request", questions: { risky: noul("Is this change risky?") } }),
+      (error: unknown) => {
+        assert.ok(error instanceof TypeSafeIntegrationError, `expected pi-typesafe's timeout error, got ${String(error)}`);
+        assert.equal(error.code, "timeout", "the timeout reaches the caller, not an unreadable-body failure");
+        return true;
+      },
+    );
+    // pi-typesafe constructs its client with retry: { maxRetries: 0 }, so a timed-out call is never re-sent.
+    assert.equal(requests, 1, "a timed-out judgment is sent once, not retried");
+  } finally {
+    for (const socket of held) socket.destroy();
     server.close();
     rmSync(dir, { recursive: true, force: true });
   }
